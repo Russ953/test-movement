@@ -1,77 +1,95 @@
 -- ==========================================
--- MOVEMENT SCRIPT v9
+-- MOVEMENT SCRIPT v10
 -- ==========================================
--- BUG (v8): After jumping a laser, laserPassedFlag[item] = true correctly blocked jumping.
--- BUT the isEscaping branch still allowed the passed laser to WIN the closest-laser contest
--- when distToLine < CLEARANCE_DISTANCE. That made the bot treat the already-crossed laser
--- as its movement target and walk BACK toward it, causing a hit from behind.
+-- ROOT CAUSE OF v9 BUG:
+--   Side-flip detection (prevSide ~= currentSide) fired when the PLAYER
+--   walked across the laser's local-Z plane, not just when the laser swept
+--   past the player. This caused un-jumped lasers to be falsely marked as
+--   passed, so the bot walked straight into them.
 --
--- FIX (v9): A passed laser is COMPLETELY skipped with `continue` in ALL cases.
--- The bot never sets a movement target toward a passed laser under any circumstance.
--- If no un-passed laser exists the bot simply walks to mapCenter (safe centre).
--- The RESET_DISTANCE logic is unchanged: the flag clears only once the laser has swept
--- far enough away that it could realistically approach again.
+-- FIX IN v10:
+--   "Passed" is now determined by the LASER'S OWN VELOCITY, not by a
+--   side-flip of the player's relative position.
+--   A laser is marked passed when:
+--     1. The laser's velocity dot the player-to-laser vector is NEGATIVE
+--        (laser is genuinely moving away from the player), AND
+--     2. The laser is already very close (< PASS_CONFIRM_DIST) so we know
+--        it really did go past, not just that it's far away and moving.
+--   Side-flip is kept as a secondary confirmation but ONLY when the laser
+--   is actually moving (speed > LASER_MOVE_THRESHOLD) to filter out noise
+--   from the player's own movement.
+--
+--   RESET uses world-space distance so it reliably clears regardless of
+--   how the laser is oriented.
 -- ==========================================
-print("[Movement] v9 loaded")
+print("[Movement] v10 loaded")
 
-local Players = game:GetService("Players")
+local Players    = game:GetService("Players")
 local RunService = game:GetService("RunService")
 
-local player = Players.LocalPlayer
+local player    = Players.LocalPlayer
 local character = player.Character or player.CharacterAdded:Wait()
-local humanoid = character:WaitForChild("Humanoid")
-local rootPart = character:WaitForChild("HumanoidRootPart")
+local humanoid  = character:WaitForChild("Humanoid")
+local rootPart  = character:WaitForChild("HumanoidRootPart")
 
-local mapPart = workspace:WaitForChild("Laser Game Map"):WaitForChild("Cylinder.005")
+local mapPart      = workspace:WaitForChild("Laser Game Map"):WaitForChild("Cylinder.005")
 local lasersFolder = workspace:WaitForChild("Lasers"):WaitForChild("ActiveLasers")
 
 local maxMapDimension = math.max(mapPart.Size.X, mapPart.Size.Y, mapPart.Size.Z)
-local safeRadius = (maxMapDimension / 2) - 5
-local mapCenter = mapPart.Position
+local safeRadius      = (maxMapDimension / 2) - 5
+local mapCenter       = mapPart.Position
 
-local JUMP_TRIGGER_DISTANCE = 5.5
-local AGGRO_DISTANCE         = 15
-local JUMP_COOLDOWN          = 0.1
--- Flag resets only once the laser has swept this far away.
--- Kept larger than AGGRO_DISTANCE so the flag can never flip back on while
--- the laser is still close enough to threaten the player.
-local RESET_DISTANCE = AGGRO_DISTANCE + 2   -- 17 studs
+-- Tuning constants
+local JUMP_TRIGGER_DISTANCE = 5.5   -- local-Z studs, fire jump
+local AGGRO_DISTANCE        = 15    -- local-Z studs, start reacting
+local JUMP_COOLDOWN         = 0.1   -- seconds between jumps
+
+-- A laser is confirmed passed when it is THIS close AND moving away.
+-- Keeps false-positives from far lasers that happen to move away briefly.
+local PASS_CONFIRM_DIST     = 8     -- local-Z studs
+
+-- Minimum laser speed (studs/s) required for the velocity check to count.
+-- Below this we treat the laser as stationary / noise.
+local LASER_MOVE_THRESHOLD  = 0.5
+
+-- WORLD-SPACE distance at which the passed flag resets.
+-- Using world-space so it works regardless of laser orientation.
+-- Must be large enough that the laser is no longer a threat.
+local RESET_WORLD_DIST      = 22    -- world studs
 
 local lastLaserCFrames = setmetatable({}, {__mode = "k"})
 local lastLaserSide    = setmetatable({}, {__mode = "k"})
 local laserPassedFlag  = setmetatable({}, {__mode = "k"})
-local lastJumpTime = 0
+local lastJumpTime     = 0
 
 local lastDebugPrint = 0
 local DEBUG_INTERVAL = 0.25
 
 -- ==========================================
--- ARC VISUALIZER SETUP
+-- ARC VISUALIZER
 -- ==========================================
 local vizFolder = workspace:FindFirstChild("JumpArcVisualizer")
 if not vizFolder then
-	vizFolder = Instance.new("Folder")
+	vizFolder      = Instance.new("Folder")
 	vizFolder.Name = "JumpArcVisualizer"
 	vizFolder.Parent = workspace
 end
 
 local vizParts = {}
 for i = 1, 15 do
-	local p = Instance.new("Part")
-	p.Size = Vector3.new(0.4, 0.4, 0.4)
-	p.Anchored = true
-	p.CanCollide = false
-	p.Material = Enum.Material.Neon
-	p.Shape = Enum.PartType.Ball
-	p.Transparency = 1
-	p.Parent = vizFolder
-	vizParts[i] = p
+	local p          = Instance.new("Part")
+	p.Size           = Vector3.new(0.4, 0.4, 0.4)
+	p.Anchored       = true
+	p.CanCollide     = false
+	p.Material       = Enum.Material.Neon
+	p.Shape          = Enum.PartType.Ball
+	p.Transparency   = 1
+	p.Parent         = vizFolder
+	vizParts[i]      = p
 end
 
 local function hideVisualizer()
-	for _, p in ipairs(vizParts) do
-		p.Transparency = 1
-	end
+	for _, p in ipairs(vizParts) do p.Transparency = 1 end
 end
 
 -- ==========================================
@@ -80,8 +98,10 @@ end
 local function predictJumpSafety(laser, laserVelocity)
 	if not laser then return false end
 
-	local g = workspace.Gravity
-	local jumpPower = humanoid.UseJumpPower and humanoid.JumpPower or math.sqrt(2 * g * humanoid.JumpHeight)
+	local g         = workspace.Gravity
+	local jumpPower = humanoid.UseJumpPower
+		and humanoid.JumpPower
+		or  math.sqrt(2 * g * humanoid.JumpHeight)
 	local walkSpeed = humanoid.WalkSpeed
 
 	local moveDir = humanoid.MoveDirection
@@ -95,140 +115,157 @@ local function predictJumpSafety(laser, laserVelocity)
 
 	for i = 1, steps do
 		local t  = i * timeStep
-		local pX = startPos.X + (moveDir.X * walkSpeed * t)
-		local pZ = startPos.Z + (moveDir.Z * walkSpeed * t)
-		local pY = startPos.Y + (jumpPower * t) - (0.5 * g * t * t)
-		local trajectoryPoint = Vector3.new(pX, pY, pZ)
+		local pX = startPos.X + moveDir.X * walkSpeed * t
+		local pZ = startPos.Z + moveDir.Z * walkSpeed * t
+		local pY = startPos.Y + jumpPower * t - 0.5 * g * t * t
+		local tp = Vector3.new(pX, pY, pZ)
 
-		local futureLaserPos   = laser.Position + (laserVelocity * t)
-		local futureLaserCFrame = laser.CFrame - laser.Position + futureLaserPos
-		local localPoint = futureLaserCFrame:PointToObjectSpace(trajectoryPoint)
+		local futureLaserPos = laser.Position + laserVelocity * t
+		local futureCF       = laser.CFrame - laser.Position + futureLaserPos
+		local lp             = futureCF:PointToObjectSpace(tp)
 
-		local boundX = (laser.Size.X / 2) + 1.2
-		local boundY = (laser.Size.Y / 2) + 2.6
-		local boundZ = (laser.Size.Z / 2) + 1.2
-
-		if math.abs(localPoint.X) < boundX and math.abs(localPoint.Y) < boundY and math.abs(localPoint.Z) < boundZ then
+		if math.abs(lp.X) < laser.Size.X / 2 + 1.2
+		and math.abs(lp.Y) < laser.Size.Y / 2 + 2.6
+		and math.abs(lp.Z) < laser.Size.Z / 2 + 1.2 then
 			isSafe = false
 		end
 
-		vizParts[i].Position    = trajectoryPoint
+		vizParts[i].Position    = tp
 		vizParts[i].Transparency = 0
 	end
 
-	local arcColor = isSafe and Color3.new(0, 1, 0) or Color3.new(1, 0, 0)
-	for i = 1, steps do vizParts[i].Color = arcColor end
-
+	local col = isSafe and Color3.new(0,1,0) or Color3.new(1,0,0)
+	for i = 1, steps do vizParts[i].Color = col end
 	return isSafe
 end
 
 -- ==========================================
 -- HELPERS
 -- ==========================================
-local function clampToSafeZone(targetPos)
-	local offset     = targetPos - mapCenter
-	local flatOffset = Vector3.new(offset.X, 0, offset.Z)
-	if flatOffset.Magnitude > safeRadius then
-		local clampedFlat = flatOffset.Unit * safeRadius
-		return Vector3.new(mapCenter.X + clampedFlat.X, targetPos.Y, mapCenter.Z + clampedFlat.Z)
+local function clampToSafeZone(pos)
+	local off  = pos - mapCenter
+	local flat = Vector3.new(off.X, 0, off.Z)
+	if flat.Magnitude > safeRadius then
+		local c = flat.Unit * safeRadius
+		return Vector3.new(mapCenter.X + c.X, pos.Y, mapCenter.Z + c.Z)
 	end
-	return targetPos
+	return pos
 end
 
 -- ==========================================
 -- CLOSEST LASER DETECTION
 -- ==========================================
 local function getClosestLaser(dt, now)
-	local closestLaser    = nil
-	local minDistance     = math.huge
+	local closestLaser     = nil
+	local minDistance      = math.huge
 	local closestTargetPos = nil
-	local laserVelocity   = Vector3.zero
-	local canJumpClosest  = false
+	local laserVelocity    = Vector3.zero
 
 	local playerPos   = rootPart.Position
 	local shouldPrint = (now - lastDebugPrint) >= DEBUG_INTERVAL
 
 	for _, item in ipairs(lasersFolder:GetChildren()) do
 		if not item:IsA("BasePart") then continue end
-
 		item.CanCollide = false
 
-		local objPos    = item.CFrame:PointToObjectSpace(playerPos)
-		local distToLine = math.abs(objPos.Z)
+		-- localZ: how far the player is in front of / behind the laser face
+		local objPos     = item.CFrame:PointToObjectSpace(playerPos)
+		local localZ     = math.abs(objPos.Z)
 		local currentSide = math.sign(objPos.Z)
 		if currentSide == 0 then currentSide = 1 end
 
-		-- Track CFrame for velocity calculation
+		-- World-space distance for the reset check
+		local worldDist = (item.Position - playerPos).Magnitude
+
+		-- CFrame delta → laser velocity in world space
 		local oldCF = lastLaserCFrames[item]
 		lastLaserCFrames[item] = item.CFrame
-
-		local currentVel = Vector3.zero
+		local vel = Vector3.zero
 		if oldCF then
-			currentVel = (item.Position - oldCF.Position) / dt
+			vel = (item.Position - oldCF.Position) / dt
 		end
+		local speed = vel.Magnitude
 
-		-- ── RESET ────────────────────────────────────────────────────────────
-		-- The flag may only clear once the laser has moved far enough away.
-		-- Using RESET_DISTANCE (> AGGRO_DISTANCE) guarantees the laser cannot
-		-- become dangerous again before the flag resets.
-		if distToLine > RESET_DISTANCE then
+		-- ── RESET (world-space) ────────────────────────────────────────────
+		-- Use world-space so orientation doesn't matter.
+		-- Flag clears only once the laser is physically far from the player.
+		if worldDist > RESET_WORLD_DIST then
 			if laserPassedFlag[item] then
-				print(string.format("[RESET] '%s' dist=%.2f - flag cleared", item.Name, distToLine))
+				print(string.format("[RESET] '%s' worldDist=%.2f", item.Name, worldDist))
 			end
 			laserPassedFlag[item] = false
 			lastLaserSide[item]   = nil
 			continue
 		end
 
-		-- ── SIDE-FLIP DETECTION ───────────────────────────────────────────────
-		-- When the player's local Z sign relative to the laser flips, the laser
-		-- has swept through the player's position → mark as passed.
-		-- Guard: once true, no subsequent flip can clear it (laser may sweep back).
-		local prevSide = lastLaserSide[item]
-		lastLaserSide[item] = currentSide
-
+		-- ── PASSED DETECTION (velocity-based) ─────────────────────────────
+		-- Only mark passed when the laser is ACTUALLY MOVING away from the
+		-- player. This filters out false positives caused by the player
+		-- walking across the laser's local-Z plane themselves.
 		if not laserPassedFlag[item] then
-			if prevSide and prevSide ~= currentSide then
-				laserPassedFlag[item] = true
-				print(string.format("[SIDEFLIP] '%s' %d->%d dist=%.2f - marked passed",
-					item.Name, prevSide, currentSide, distToLine))
+			if speed > LASER_MOVE_THRESHOLD then
+				-- Vector from laser to player (flat, world space)
+				local toPlayer = Vector3.new(
+					playerPos.X - item.Position.X,
+					0,
+					playerPos.Z - item.Position.Z
+				)
+				local flatVel = Vector3.new(vel.X, 0, vel.Z)
+
+				-- dot < 0 means laser is moving AWAY from player
+				local dot = (toPlayer.Magnitude > 0.01)
+					and flatVel:Dot(toPlayer.Unit)
+					or 0
+
+				-- Require: laser moving away AND the player is already very
+				-- close (localZ < PASS_CONFIRM_DIST) so we know it just passed.
+				if dot < -0.3 and localZ < PASS_CONFIRM_DIST then
+					laserPassedFlag[item] = true
+					print(string.format(
+						"[PASSED-VEL] '%s' dot=%.3f localZ=%.2f speed=%.2f",
+						item.Name, dot, localZ, speed))
+				end
+
+				-- Secondary: side-flip while laser is moving (genuine crossing)
+				local prevSide = lastLaserSide[item]
+				if prevSide and prevSide ~= currentSide then
+					laserPassedFlag[item] = true
+					print(string.format(
+						"[PASSED-FLIP] '%s' %d->%d localZ=%.2f speed=%.2f",
+						item.Name, prevSide, currentSide, localZ, speed))
+				end
 			end
+			-- If laser is barely moving we do NOT set the flag on a side-flip
+			-- because that flip came from the player walking, not the laser.
 		end
+
+		lastLaserSide[item] = currentSide
 
 		local isPassed = laserPassedFlag[item] == true
 
-		if shouldPrint and distToLine <= AGGRO_DISTANCE then
-			print(string.format("[DBG] '%s' dist=%.2f side=%d passed=%s canJump=%s",
-				item.Name, distToLine, currentSide,
-				tostring(isPassed), tostring(not isPassed)))
+		if shouldPrint and localZ <= AGGRO_DISTANCE then
+			print(string.format(
+				"[DBG] '%s' localZ=%.2f worldDist=%.2f passed=%s spd=%.2f",
+				item.Name, localZ, worldDist, tostring(isPassed), speed))
 		end
 
-		-- ── CORE FIX ──────────────────────────────────────────────────────────
-		-- A passed laser is COMPLETELY ignored for movement decisions.
-		-- v8 had an "isEscaping" branch that let a passed laser win the
-		-- closest-laser contest when dist < CLEARANCE_DISTANCE.  That caused
-		-- the bot to set a movement target pointing BACK at the passed laser,
-		-- walking the player straight into it from behind.
-		-- Solution: hard `continue` with no exceptions. The bot will fall
-		-- through to the mapCenter fallback if no live laser needs attention.
-		if isPassed then
-			continue
-		end
+		-- Completely ignore passed lasers - no movement target, no jump
+		if isPassed then continue end
 
-		-- ── CLOSEST LIVE LASER ────────────────────────────────────────────────
-		if distToLine < minDistance then
-			minDistance       = distToLine
-			closestLaser      = item
-			laserVelocity     = currentVel
-			canJumpClosest    = true
-			-- Target point: same X position, but on the FAR side of the laser
-			closestTargetPos  = item.CFrame * Vector3.new(objPos.X, 0, -currentSide * 15)
+		-- Only react within AGGRO_DISTANCE (local-Z)
+		if localZ > AGGRO_DISTANCE then continue end
+
+		if localZ < minDistance then
+			minDistance      = localZ
+			closestLaser     = item
+			laserVelocity    = vel
+			-- Walk to the far side of the laser
+			closestTargetPos = item.CFrame * Vector3.new(objPos.X, 0, -currentSide * 15)
 		end
 	end
 
 	if shouldPrint then lastDebugPrint = now end
-
-	return closestLaser, closestTargetPos, minDistance, laserVelocity, canJumpClosest
+	return closestLaser, closestTargetPos, minDistance, laserVelocity
 end
 
 -- ==========================================
@@ -241,35 +278,27 @@ RunService.Heartbeat:Connect(function(dt)
 	end
 
 	local now = tick()
-	local laser, targetPos, dist, laserVelocity, canJump = getClosestLaser(dt, now)
-	local currentState = humanoid:GetState()
-	local isInAir = (currentState == Enum.HumanoidStateType.Freefall
-	              or currentState == Enum.HumanoidStateType.Jumping)
+	local laser, targetPos, dist, laserVelocity = getClosestLaser(dt, now)
+	local state   = humanoid:GetState()
+	local isInAir = state == Enum.HumanoidStateType.Freefall
+	             or state == Enum.HumanoidStateType.Jumping
 
-	if (now - lastJumpTime) < JUMP_COOLDOWN then
-		canJump = false
-	end
+	local canJump = (now - lastJumpTime) >= JUMP_COOLDOWN
 
 	if laser and targetPos then
-		if dist <= AGGRO_DISTANCE then
-			humanoid:MoveTo(clampToSafeZone(targetPos))
+		humanoid:MoveTo(clampToSafeZone(targetPos))
 
-			if canJump and dist <= JUMP_TRIGGER_DISTANCE + 5 and not isInAir then
-				local jumpIsSafe = predictJumpSafety(laser, laserVelocity)
-				if dist <= JUMP_TRIGGER_DISTANCE and jumpIsSafe then
-					print(string.format("[JUMP] Firing! laser='%s' dist=%.2f", laser.Name, dist))
-					lastJumpTime = now
-					humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-				end
-			elseif isInAir or not canJump then
-				hideVisualizer()
+		if canJump and dist <= JUMP_TRIGGER_DISTANCE + 5 and not isInAir then
+			local safe = predictJumpSafety(laser, laserVelocity)
+			if dist <= JUMP_TRIGGER_DISTANCE and safe then
+				print(string.format("[JUMP] '%s' dist=%.2f", laser.Name, dist))
+				lastJumpTime = now
+				humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
 			end
-		else
+		elseif isInAir or not canJump then
 			hideVisualizer()
-			if not isInAir then humanoid:MoveTo(mapCenter) end
-		end
+			end
 	else
-		-- No live laser threatening us - walk to centre and wait
 		hideVisualizer()
 		if not isInAir then humanoid:MoveTo(mapCenter) end
 	end
