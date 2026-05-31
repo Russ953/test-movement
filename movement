@@ -1,7 +1,7 @@
 -- ==========================================
--- MOVEMENT SCRIPT v5 (DEBUG)
+-- MOVEMENT SCRIPT v6
 -- ==========================================
-print("[Movement] v5 loaded - DEBUG MODE")
+print("[Movement] v6 loaded")
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -23,12 +23,11 @@ local AGGRO_DISTANCE = 15
 local CLEARANCE_DISTANCE = 6
 local JUMP_COOLDOWN = 0.1
 
-local lastLaserPositions = setmetatable({}, {__mode = "k"})
+local lastLaserCFrames = setmetatable({}, {__mode = "k"})
 local lastJumpTime = 0
 
--- Throttle debug prints so they don't flood every frame
 local lastDebugPrint = 0
-local DEBUG_INTERVAL = 0.25 -- print at most every 0.25 seconds
+local DEBUG_INTERVAL = 0.25
 
 -- ==========================================
 -- ARC VISUALIZER SETUP
@@ -145,39 +144,67 @@ local function getClosestLaser(dt, now)
 			local currentSide = math.sign(objPos.Z)
 			if currentSide == 0 then currentSide = 1 end
 
-			local oldPos = lastLaserPositions[item]
-			lastLaserPositions[item] = item.Position
+			local oldCF = lastLaserCFrames[item]
+			lastLaserCFrames[item] = item.CFrame
 
 			local currentVel = Vector3.zero
 			local isMovingAway = false
-			local dot = 0
+			local sweepDot = 0
+			local transDot = 0
 
-			if oldPos then
-				currentVel = (item.Position - oldPos) / dt
+			if oldCF then
+				-- World-space translation velocity
+				local posDelta = item.Position - oldCF.Position
+				currentVel = posDelta / dt
 
-				local toPlayer = Vector3.new(playerPos.X - item.Position.X, 0, playerPos.Z - item.Position.Z)
+				local toPlayer = Vector3.new(
+					playerPos.X - item.Position.X,
+					0,
+					playerPos.Z - item.Position.Z
+				)
 
 				if toPlayer.Magnitude > 0.01 then
 					local toPlayerUnit = toPlayer.Unit
-					local flatVel = Vector3.new(currentVel.X, 0, currentVel.Z)
-					dot = flatVel:Dot(toPlayerUnit)
 
-					if dot < -0.05 then
-						isMovingAway = true
+					-- CHECK 1: Translation (for lasers that slide)
+					local flatVel = Vector3.new(currentVel.X, 0, currentVel.Z)
+					transDot = flatVel:Dot(toPlayerUnit)
+
+					-- CHECK 2: Rotation / sweep (for pivot lasers whose position never changes)
+					-- The laser's local Z axis points along its length.
+					-- We compare where that Z axis pointed last frame vs this frame
+					-- relative to the player direction to see which way it is sweeping.
+					local oldFwd = Vector3.new(oldCF.LookVector.X, 0, oldCF.LookVector.Z)
+					local newFwd = Vector3.new(item.CFrame.LookVector.X, 0, item.CFrame.LookVector.Z)
+
+					if oldFwd.Magnitude > 0.01 and newFwd.Magnitude > 0.01 then
+						-- Angular velocity direction via cross product (Y component = rotation around Y axis)
+						local cross = oldFwd:Cross(newFwd)
+						-- If cross.Y > 0 the laser rotated counter-clockwise, < 0 clockwise
+						-- The tip of the laser moves in the direction perpendicular to LookVector
+						-- We need to know if that sweep is carrying the beam AWAY from the player
+						-- Tip velocity direction = cross(up, lookVector) * sign(cross.Y)
+						local up = Vector3.new(0, 1, 0)
+						local sweepDir = up:Cross(newFwd) * math.sign(cross.Y + 1e-9)
+						if sweepDir.Magnitude > 0.01 then
+							sweepDot = sweepDir.Unit:Dot(toPlayerUnit)
+						end
 					end
+
+					-- Moving away if EITHER translation is going away OR sweep is going away
+					-- Use a small threshold to filter noise
+					local isTransAway = transDot < -0.05
+					local isSweepAway = sweepDot < -0.1
+					isMovingAway = isTransAway or isSweepAway
 				end
 			end
 
-			-- DEBUG: print every laser's state at a throttled rate
 			if shouldPrint and distToLine <= AGGRO_DISTANCE then
 				print(string.format(
-					"[DBG] Laser '%s' | dist=%.2f | side=%d | dot=%.4f | movingAway=%s | canJump=%s",
-					item.Name,
-					distToLine,
-					currentSide,
-					dot,
-					tostring(isMovingAway),
-					tostring(not isMovingAway)
+					"[DBG] '%s' dist=%.2f side=%d transDot=%.3f sweepDot=%.3f away=%s canJump=%s",
+					item.Name, distToLine, currentSide,
+					transDot, sweepDot,
+					tostring(isMovingAway), tostring(not isMovingAway)
 				))
 			end
 
@@ -221,8 +248,7 @@ RunService.Heartbeat:Connect(function(dt)
 	local currentState = humanoid:GetState()
 	local isInAir = (currentState == Enum.HumanoidStateType.Freefall or currentState == Enum.HumanoidStateType.Jumping)
 
-	local inCooldown = (now - lastJumpTime) < JUMP_COOLDOWN
-	if inCooldown then
+	if (now - lastJumpTime) < JUMP_COOLDOWN then
 		canJump = false
 	end
 
@@ -235,10 +261,9 @@ RunService.Heartbeat:Connect(function(dt)
 				local jumpIsSafe = predictJumpSafety(laser, laserVelocity)
 
 				if dist <= JUMP_TRIGGER_DISTANCE and jumpIsSafe then
-					-- DEBUG: print exactly why a jump was triggered
 					print(string.format(
-						"[JUMP] Firing jump! laser='%s' dist=%.2f canJump=%s jumpIsSafe=%s inCooldown=%s",
-						laser.Name, dist, tostring(canJump), tostring(jumpIsSafe), tostring(inCooldown)
+						"[JUMP] Firing! laser='%s' dist=%.2f canJump=%s safe=%s",
+						laser.Name, dist, tostring(canJump), tostring(jumpIsSafe)
 					))
 					lastJumpTime = now
 					humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
