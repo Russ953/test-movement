@@ -16,11 +16,12 @@ local mapCenter = mapPart.Position
 local JUMP_TRIGGER_DISTANCE = 5.5
 local AGGRO_DISTANCE = 15
 local CLEARANCE_DISTANCE = 6
-local JUMP_COOLDOWN = 0.1 -- Seconds to pause after a jump before re-evaluating
+local JUMP_COOLDOWN = 0.1
 
--- Velocity tracking and jump cooldown
+-- THE FIX: Track each laser's previous CFrame to measure its OWN movement
+-- We measure from a FROZEN reference point (the laser's previous position against the map center)
+-- This means your character's walking speed does NOT affect the velocity reading at all
 local lastLaserCFrames = setmetatable({}, {__mode = "k"})
-local lastLaserDistances = setmetatable({}, {__mode = "k"}) -- track raw perpendicular distance per laser
 local lastJumpTime = 0
 
 -- ==========================================
@@ -140,28 +141,42 @@ local function getClosestLaser(dt)
 			local oldCFrame = lastLaserCFrames[item]
 			lastLaserCFrames[item] = item.CFrame
 
-			-- FIX: Use raw world-space distance delta instead of localMovement.Z
-			-- This is immune to rotation wobble and gives a true "closer or further" reading
-			local prevDist = lastLaserDistances[item] or distToLine
-			lastLaserDistances[item] = distToLine
-			local distanceDelta = distToLine - prevDist -- Positive = moving away, Negative = moving closer
-
 			local currentVel = Vector3.zero
-			if oldCFrame then
-				currentVel = (item.CFrame.Position - oldCFrame.Position) / dt
-			end
+			local isMovingAway = false
 
-			-- If distance is actively growing, the laser is moving away from us
-			local isMovingAway = distanceDelta > 0.01
+			if oldCFrame then
+				-- CORE FIX: Measure the laser's movement against the MAP CENTER (a frozen point)
+				-- This is 100% independent of where the player is walking.
+				-- If the laser is moving away from the map center in the direction of the player,
+				-- it means the laser is moving away from the player regardless of player movement.
+				local oldDistToCenter = math.abs(oldCFrame:PointToObjectSpace(mapCenter).Z)
+				local newDistToCenter = math.abs(item.CFrame:PointToObjectSpace(mapCenter).Z)
+
+				-- The laser's own velocity in world space (studs per second)
+				currentVel = (item.CFrame.Position - oldCFrame.Position) / dt
+
+				-- Check: is the laser sweeping outward (away from map center = away from player)?
+				-- We also verify the player is on the same side as the outward direction
+				local laserMovingOutward = (newDistToCenter > oldDistToCenter + 0.005)
+				
+				-- Only flag as moving away if the laser is heading in the direction AWAY from the player
+				-- i.e., the laser is on the same side as the player AND moving outward
+				if laserMovingOutward then
+					-- Extra confirmation: check if the laser's outward direction matches the player's side
+					local velInLaserSpace = item.CFrame:VectorToObjectSpace(currentVel)
+					-- If the laser velocity Z component matches the player's side sign, it's truly moving away
+					if math.sign(velInLaserSpace.Z) == currentSide then
+						isMovingAway = true
+					end
+				end
+			end
 
 			local isEscaping = false
 			if isMovingAway then
 				if distToLine < CLEARANCE_DISTANCE then
-					-- Too close to the back side, keep walking away until we hit clearance
 					isEscaping = true
 				else
-					-- Far enough away and moving away, ignore completely
-					continue
+					continue -- Far enough and moving away, ignore completely
 				end
 			end
 
@@ -170,7 +185,7 @@ local function getClosestLaser(dt)
 				closestLaser = item
 				laserVelocity = currentVel
 
-				-- Hard rule: only allow jump if laser is approaching us, NEVER if it's moving away
+				-- Hard rule: NEVER allow jump if the laser is moving away from us
 				canJumpClosest = not isMovingAway
 
 				local targetSide = isEscaping and currentSide or -currentSide
@@ -194,9 +209,7 @@ RunService.Heartbeat:Connect(function(dt)
 	local currentState = humanoid:GetState()
 	local isInAir = (currentState == Enum.HumanoidStateType.Freefall or currentState == Enum.HumanoidStateType.Jumping)
 
-	-- Post-jump cooldown: hard-lock canJump for 0.1s after every jump
-	-- During this window the distanceDelta check has time to correctly classify
-	-- whether the laser is now retreating or still approaching
+	-- Hard-lock canJump for 0.1s after every jump
 	if (now - lastJumpTime) < JUMP_COOLDOWN then
 		canJump = false
 	end
@@ -210,7 +223,7 @@ RunService.Heartbeat:Connect(function(dt)
 				local jumpIsSafe = predictJumpSafety(laser, laserVelocity)
 
 				if dist <= JUMP_TRIGGER_DISTANCE and jumpIsSafe then
-					lastJumpTime = now -- Record the exact time of the jump
+					lastJumpTime = now
 					humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
 				end
 			elseif isInAir or not canJump then
