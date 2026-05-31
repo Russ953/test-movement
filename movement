@@ -1,39 +1,33 @@
 -- ==========================================
--- MOVEMENT SCRIPT v15
+-- MOVEMENT SCRIPT v16
 -- ==========================================
--- NEW in v15:
+-- FIXES vs v15:
 --
--- 1. AIR-DASH (double jump / Stumble Guys style)
---    While in the air after a normal jump, if a laser is about to hit
---    the arc mid-flight, the script fires a second ChangeState(Jumping)
---    with a new MoveTo target to dash sideways/forward over the beam.
---    Uses a separate airdash cooldown so it only fires once per jump.
+-- FIX 1 – Jump target landing ON the laser
+--   v15 used:  laser.CFrame * Vector3.new(X, 0, -side*15)
+--   CFrame * Vector3 TRANSFORMS the point into world space relative
+--   to the laser pivot, so the target was sitting right on the beam.
+--   Fixed: compute the far-side world position by taking the player's
+--   XZ position, then stepping PAST the laser along the laser's local
+--   Z axis in world space. Pure flat arithmetic, no CFrame multiply.
 --
--- 2. FAST-LASER EARLY TRIGGER
---    TTI (time-to-impact) is recalculated every frame. If TTI < FAST_TTI
---    the jump trigger activates even if localZ > JUMP_TRIGGER_DISTANCE.
---    This catches lasers that are far but moving so fast the player
---    would be hit before reaching trigger range.
+-- FIX 2 – Visualiser only visible when laser already close
+--   collectThreats() cut off lasers at AGGRO_DISTANCE before they
+--   entered the threats table, so the arc only drew when the laser
+--   was already nearly on top of the player.
+--   Fixed: separate "visual range" (VIZ_RANGE = 40 studs) tracked
+--   outside collectThreats. Arc is drawn whenever any laser is within
+--   VIZ_RANGE, even if it is not yet an active threat.
 --
--- 3. LOOKAHEAD PATHFINDER
---    Every PLAN_INTERVAL seconds a planner simulates the next
---    PLAN_STEPS jumps into the future:
---      - For each threat laser, project its position forward by
---        (accumulated time of previous jumps + travel time).
---      - Pick the safest landing zone at each step.
---      - Store the plan as a sequence of waypoints.
---    The plan is visualised as:
---      - Yellow spheres = planned landing positions
---      - Cyan lines (thin cylinders) connecting them
---      - Each sphere labelled step 1,2,3 via BillboardGui
---    The bot follows the plan's first waypoint as its jump target
---    instead of computing it reactively each frame.
---    If the plan becomes stale (laser moved) it is re-planned.
---
--- All v14 systems kept: crossing detection, multi-laser arc,
--- position-delta move dir, stand-still-and-wait.
+-- FIX 3 – Planner choosing bad waypoints → erratic movement
+--   predictArc used:  laser.CFrame - laser.Position + (laser.Position + vel*t)
+--   This translated the CFrame's position but left its ROTATION unchanged,
+--   so for rotating lasers the hitbox was in completely the wrong place.
+--   Fixed: store the laser's angular velocity (rad/s around Y) and build
+--   the future CFrame as CFrame.new(futurePos) * CFrame.Angles(0, angle*t, 0)
+--   so both position AND rotation are projected forward correctly.
 -- ==========================================
-print("[Movement] v15 loaded")
+print("[Movement] v16 loaded")
 
 local Players    = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -57,14 +51,16 @@ local ARENA_XZ_RADIUS = (maxMapDimension / 2) + 4
 local JUMP_TRIGGER_DISTANCE = 5.5
 local APPROACH_START        = 12
 local AGGRO_DISTANCE        = 20
+local VIZ_RANGE             = 40   -- FIX 2: arc shows from this far out
 local JUMP_COOLDOWN         = 0.35
 local PASS_CONFIRM_DIST     = 8
 local LASER_MOVE_THRESHOLD  = 0.4
 local RESET_WORLD_DIST      = 24
 local TIGHT_CLEARANCE       = 1.8
-local FAST_TTI              = 0.55   -- seconds: trigger early jump for lasers this fast
-local AIRDASH_COOLDOWN      = 0.6    -- min gap between airdashes per jump
-local AIRDASH_CHECK_START   = 0.15   -- seconds into air before checking for airdash
+local FAST_TTI              = 0.55
+local AIRDASH_COOLDOWN      = 0.6
+local AIRDASH_CHECK_START   = 0.15
+local FAR_SIDE_DIST         = 14   -- studs past laser centre for jump target
 
 -- Crossing
 local MAX_CROSS_DIST  = 14
@@ -72,29 +68,28 @@ local CROSS_BOTH_DIST = 18
 local CROSS_OVERSHOOT = 5
 
 -- Lookahead planner
-local PLAN_INTERVAL  = 0.25   -- re-plan every N seconds
-local PLAN_STEPS     = 3      -- how many jumps ahead to plan
-local PLAN_CANDIDATES = 6     -- angular candidates to test per step
+local PLAN_INTERVAL   = 0.25
+local PLAN_STEPS      = 3
+local PLAN_CANDIDATES = 8
 
 -- ---- State ----
-local lastLaserCFrames = setmetatable({}, {__mode="k"})
-local lastLaserSide    = setmetatable({}, {__mode="k"})
-local laserPassedFlag  = setmetatable({}, {__mode="k"})
-local lastJumpTime     = 0
-local jumpCount        = 0
-local runStart         = tick()
-local lastRootPos      = nil
-local lastDebugPrint   = 0
-local DEBUG_INTERVAL   = 0.5
+local lastLaserCFrames  = setmetatable({}, {__mode="k"})
+local lastLaserAngVel   = setmetatable({}, {__mode="k"})  -- FIX 3
+local lastLaserSide     = setmetatable({}, {__mode="k"})
+local laserPassedFlag   = setmetatable({}, {__mode="k"})
+local lastJumpTime      = 0
+local jumpCount         = 0
+local runStart          = tick()
+local lastRootPos       = nil
+local lastDebugPrint    = 0
+local DEBUG_INTERVAL    = 0.5
 
--- Airdash state
-local jumpStartTime    = 0
-local lastAirdashTime  = -999
-local didAirdash       = false
+local jumpStartTime   = 0
+local lastAirdashTime = -999
+local didAirdash      = false
 
--- Planner state
-local lastPlanTime     = 0
-local currentPlan      = nil   -- {waypoints = {Vector3,...}, stepLasers = {...}}
+local lastPlanTime  = 0
+local currentPlan   = nil
 
 -- ==========================================
 -- HUD
@@ -127,10 +122,10 @@ local function makeLabel(yoff, col, size, bold)
 	return l
 end
 
-local timerLabel = makeLabel(4,   Color3.fromRGB(80,220,160),  17, true)
-local jumpLabel  = makeLabel(26,  Color3.fromRGB(255,200,60),  15, true)
-local crossLabel = makeLabel(48,  Color3.fromRGB(120,200,255), 13, false)
-local dashLabel  = makeLabel(68,  Color3.fromRGB(255,140,200), 13, false)
+local timerLabel = makeLabel(4,  Color3.fromRGB(80,220,160),  17, true)
+local jumpLabel  = makeLabel(26, Color3.fromRGB(255,200,60),  15, true)
+local crossLabel = makeLabel(48, Color3.fromRGB(120,200,255), 13, false)
+local dashLabel  = makeLabel(68, Color3.fromRGB(255,140,200), 13, false)
 
 timerLabel.Text = "\xe2\x8f\xb1  0.0s"
 jumpLabel.Text  = "\xf0\x9f\xa6\x98 Jumps: 0"
@@ -157,7 +152,7 @@ local function setStatus(txt, col)
 end
 
 -- ==========================================
--- VISUALIZER SETUP
+-- VISUALIZER
 -- ==========================================
 local vizFolder = workspace:FindFirstChild("JumpArcVisualizer")
 if not vizFolder then
@@ -181,10 +176,8 @@ crossMarker.CanCollide=false; crossMarker.Material=Enum.Material.Neon
 crossMarker.Shape=Enum.PartType.Ball; crossMarker.Color=Color3.fromRGB(0,220,255)
 crossMarker.Transparency=1; crossMarker.Parent=vizFolder
 
--- Lookahead visualizer: waypoint spheres + connector cylinders
-local planWPs    = {}  -- waypoint sphere parts
-local planConns  = {}  -- connector cylinder parts
-local planBBs    = {}  -- BillboardGuis for step labels
+local planWPs   = {}
+local planConns = {}
 for i = 1, PLAN_STEPS do
 	local wp = Instance.new("Part")
 	wp.Size=Vector3.new(.9,.9,.9); wp.Anchored=true; wp.CanCollide=false
@@ -203,22 +196,17 @@ for i = 1, PLAN_STEPS do
 	conn.Anchored=true; conn.CanCollide=false; conn.Material=Enum.Material.Neon
 	conn.Color=Color3.fromRGB(255,200,0); conn.Transparency=1; conn.Parent=vizFolder
 
-	planWPs[i]=wp; planConns[i]=conn; planBBs[i]=bb
+	planWPs[i]=wp; planConns[i]=conn
 end
 
 local function hidePlan()
-	for i=1,PLAN_STEPS do
-		planWPs[i].Transparency=1; planConns[i].Transparency=1
-	end
+	for i=1,PLAN_STEPS do planWPs[i].Transparency=1; planConns[i].Transparency=1 end
 end
-
 local function hideArc()
 	for _,p in ipairs(vizParts) do p.Transparency=1 end
 end
-
 local function hideAll()
-	hideArc(); hidePlan()
-	crossMarker.Transparency=1
+	hideArc(); hidePlan(); crossMarker.Transparency=1
 end
 
 local function showPlanViz(waypoints)
@@ -226,12 +214,11 @@ local function showPlanViz(waypoints)
 		if waypoints[i] then
 			wp.Position=waypoints[i]; wp.Transparency=0.15
 			local prev = i==1 and rootPart.Position or waypoints[i-1]
-			local mid  = (prev + waypoints[i]) * 0.5
-			local diff = waypoints[i] - prev
+			local diff = waypoints[i]-prev
 			local len  = diff.Magnitude
-			if len > 0.1 then
-				planConns[i].Size=Vector3.new(0.18, 0.18, len)
-				planConns[i].CFrame=CFrame.lookAt(mid, waypoints[i])
+			if len>0.1 then
+				planConns[i].Size=Vector3.new(0.18,0.18,len)
+				planConns[i].CFrame=CFrame.lookAt((prev+waypoints[i])*0.5, waypoints[i])
 				planConns[i].Transparency=0.3
 			else
 				planConns[i].Transparency=1
@@ -253,19 +240,33 @@ local function checkOnArena()
 end
 
 -- ==========================================
--- ANGULAR VELOCITY
+-- LASER PHYSICS  (FIX 3: track angVel)
+-- Returns tipVelocity (world XZ), angVelY (rad/s)
 -- ==========================================
-local function getLaserTipVelocity(item, oldCF, dt)
-	if not oldCF then return Vector3.zero end
-	local transVel = (item.Position-oldCF.Position)/dt
-	local oldFwd=Vector3.new(oldCF.LookVector.X,0,oldCF.LookVector.Z)
-	local newFwd=Vector3.new(item.CFrame.LookVector.X,0,item.CFrame.LookVector.Z)
-	if oldFwd.Magnitude<0.01 or newFwd.Magnitude<0.01 then return transVel end
-	local cross=oldFwd:Cross(newFwd)
-	local angSpeed=cross.Y/dt
-	local halfLen=item.Size.Z/2
-	local perpDir=Vector3.new(newFwd.Z,0,-newFwd.X)*math.sign(angSpeed+1e-9)
-	return transVel+perpDir*math.abs(angSpeed)*halfLen
+local function getLaserMotion(item, oldCF, dt)
+	if not oldCF then return Vector3.zero, 0 end
+	local transVel = (item.Position - oldCF.Position) / dt
+
+	local oldFwd = Vector3.new(oldCF.LookVector.X, 0, oldCF.LookVector.Z)
+	local newFwd = Vector3.new(item.CFrame.LookVector.X, 0, item.CFrame.LookVector.Z)
+	local angVelY = 0
+	if oldFwd.Magnitude>0.01 and newFwd.Magnitude>0.01 then
+		local cross = oldFwd:Cross(newFwd)
+		angVelY = cross.Y / dt
+	end
+
+	local halfLen  = item.Size.Z / 2
+	local perpDir  = Vector3.new(newFwd.Z, 0, -newFwd.X) * math.sign(angVelY + 1e-9)
+	local tipVel   = transVel + perpDir * math.abs(angVelY) * halfLen
+	return tipVel, angVelY
+end
+
+-- FIX 3: build future CFrame (position + rotation both projected)
+local function futureLaserCF(laser, vel, angVelY, t)
+	local futurePos = laser.Position + vel * t
+	local baseAngle = math.atan2(laser.CFrame.LookVector.X, laser.CFrame.LookVector.Z)
+	local futureAngle = baseAngle + angVelY * t
+	return CFrame.new(futurePos) * CFrame.Angles(0, futureAngle, 0)
 end
 
 -- ==========================================
@@ -305,64 +306,70 @@ local function getJumpPhysics()
 	return jp, tAir, g, humanoid.WalkSpeed
 end
 
--- Simulate where a laser will be after time t (translation only, good enough for planner)
-local function laserPosAt(laser, vel, t)
-	return laser.CFrame + (vel * t - laser.Position + laser.Position)
-end
-
--- Does point p collide with laser (future CFrame futureCF, size sz)?
-local function hitCheck(futureCF, sz, p, padXZ, padY)
-	local lp = futureCF:PointToObjectSpace(p)
-	return math.abs(lp.X)<sz.X/2+padXZ
-		and math.abs(lp.Y)<sz.Y/2+padY
-		and math.abs(lp.Z)<sz.Z/2+padXZ
+-- FIX 1: compute a safe jump target on the FAR side of the laser
+-- Takes the laser's world-space forward direction and steps past it
+local function farSideTarget(laser, objPos, side)
+	-- World-space flat look direction of the laser
+	local fwd = Vector3.new(laser.CFrame.LookVector.X, 0, laser.CFrame.LookVector.Z)
+	if fwd.Magnitude < 0.01 then fwd = Vector3.new(1,0,0) end
+	fwd = fwd.Unit
+	-- Perpendicular to the laser (the direction ACROSS it, which is local Z in laser space)
+	local across = fwd:Cross(Vector3.new(0,1,0)).Unit  -- world right of laser = laser's local X axis
+	-- "side" tells us which side of the laser the player is on (local Z sign)
+	-- We want to land on the OPPOSITE side, so we move in -side * laser's local Z world direction
+	-- laser's local Z world dir = laser.CFrame.LookVector projected flat... wait:
+	-- In Roblox the laser extends along its Z axis (Size.Z).
+	-- local Z = laser.CFrame.LookVector
+	-- Player is at localZ = objPos.Z, side = sign(localZ)
+	-- Far side = move in direction of -side along the laser's LookVector
+	local laserZ = Vector3.new(laser.CFrame.LookVector.X, 0, laser.CFrame.LookVector.Z).Unit
+	local targetPos = laser.Position
+		+ laserZ * (-side * FAR_SIDE_DIST)   -- step past the laser pivot
+		+ across * objPos.X                   -- keep the lateral (X) offset so we land cleanly
+	targetPos = Vector3.new(targetPos.X, ARENA_TOP+0.5, targetPos.Z)
+	return clampToSafe(targetPos)
 end
 
 -- ==========================================
--- MULTI-LASER ARC PREDICTION
--- startPos overridable for planner
+-- ARC PREDICTION  (FIX 3: use futureLaserCF)
 -- ==========================================
-local function predictArc(lasers, velocities, moveDir, startPos, showViz, timeOffset)
+local function predictArc(lasers, vels, angVels, moveDir, startPos, showViz, timeOffset)
 	if #lasers==0 then return true, math.huge end
 	local jp, tAir, g, ws = getJumpPhysics()
 	timeOffset = timeOffset or 0
 
 	local md = moveDir
 	if not md or md.Magnitude<0.01 then md=rootPart.CFrame.LookVector end
-	md=Vector3.new(md.X,0,md.Z)
+	md = Vector3.new(md.X,0,md.Z)
 	if md.Magnitude>0.01 then md=md.Unit end
 
-	local ts=tAir/VIZ_STEPS
-	local sp=startPos or rootPart.Position
+	local ts = tAir/VIZ_STEPS
+	local sp = startPos or rootPart.Position
 	local safe=true; local minGap=math.huge
 
 	for i=1,VIZ_STEPS do
-		local t=i*ts
-		local tp=Vector3.new(
-			sp.X+md.X*ws*t,
-			sp.Y+jp*t-0.5*g*t*t,
-			sp.Z+md.Z*ws*t
+		local t = i*ts
+		local tp = Vector3.new(
+			sp.X + md.X*ws*t,
+			sp.Y + jp*t - 0.5*g*t*t,
+			sp.Z + md.Z*ws*t
 		)
 		for li,laser in ipairs(lasers) do
-			local vel=velocities[li]
-			local fcf=laser.CFrame-laser.Position+(laser.Position+vel*(t+timeOffset))
-			local lp=fcf:PointToObjectSpace(tp)
+			local fcf = futureLaserCF(laser, vels[li], angVels[li], t+timeOffset)
+			local lp  = fcf:PointToObjectSpace(tp)
 			local bX=laser.Size.X/2+1.2; local bY=laser.Size.Y/2+2.6; local bZ=laser.Size.Z/2+1.2
 			if math.abs(lp.X)<bX and math.abs(lp.Y)<bY and math.abs(lp.Z)<bZ then safe=false end
 			local gap=math.min(bX-math.abs(lp.X), bY-math.abs(lp.Y), bZ-math.abs(lp.Z))
 			minGap=math.min(minGap, math.abs(gap))
 		end
-		if showViz then
-			vizParts[i].Position=tp; vizParts[i].Transparency=0
-		end
+		if showViz then vizParts[i].Position=tp; vizParts[i].Transparency=0 end
 	end
 
 	-- Landing check
 	if safe then
 		local landPos=Vector3.new(sp.X+md.X*ws*tAir, sp.Y, sp.Z+md.Z*ws*tAir)
 		for li,laser in ipairs(lasers) do
-			local vel=velocities[li]
-			local fcf=laser.CFrame-laser.Position+(laser.Position+vel*(tAir+timeOffset))
+			local fcf=futureLaserCF(laser, vels[li], angVels[li], tAir+timeOffset)
 			local lp=fcf:PointToObjectSpace(landPos)
 			if math.abs(lp.X)<laser.Size.X/2+1.4 and math.abs(lp.Z)<laser.Size.Z/2+1.4 then
 				safe=false
@@ -371,8 +378,9 @@ local function predictArc(lasers, velocities, moveDir, startPos, showViz, timeOf
 	end
 
 	if showViz then
-		local col=safe and (minGap<TIGHT_CLEARANCE and Color3.fromRGB(255,160,30) or Color3.fromRGB(60,220,100))
-			or Color3.fromRGB(255,50,50)
+		local col=safe
+			and (minGap<TIGHT_CLEARANCE and Color3.fromRGB(255,160,30) or Color3.fromRGB(60,220,100))
+			or  Color3.fromRGB(255,50,50)
 		for i=1,VIZ_STEPS do vizParts[i].Color=col end
 	end
 	return safe, minGap
@@ -381,33 +389,37 @@ end
 -- ==========================================
 -- LASER COLLECTION
 -- ==========================================
+-- Returns threats (active) and vizLasers (all within VIZ_RANGE, for arc display)
 local function collectThreats(dt, now)
-	local threats   = {}
-	local playerPos = rootPart.Position
+	local threats    = {}
+	local vizLasers  = {}   -- FIX 2: wider list just for visualiser
+	local playerPos  = rootPart.Position
 	local sp = (now-lastDebugPrint)>=DEBUG_INTERVAL
 
 	for _,item in ipairs(lasersFolder:GetChildren()) do
 		if not item:IsA("BasePart") then continue end
 		item.CanCollide=false
 
-		local objPos=item.CFrame:PointToObjectSpace(playerPos)
-		local localZ=math.abs(objPos.Z)
-		local currentSide=math.sign(objPos.Z); if currentSide==0 then currentSide=1 end
-		local worldDist=(item.Position-playerPos).Magnitude
+		local objPos     = item.CFrame:PointToObjectSpace(playerPos)
+		local localZ     = math.abs(objPos.Z)
+		local currentSide= math.sign(objPos.Z); if currentSide==0 then currentSide=1 end
+		local worldDist  = (item.Position-playerPos).Magnitude
 
-		local oldCF=lastLaserCFrames[item]
-		lastLaserCFrames[item]=item.CFrame
-		local tipVel=getLaserTipVelocity(item, oldCF, dt)
-		local speed=tipVel.Magnitude
+		local oldCF = lastLaserCFrames[item]
+		lastLaserCFrames[item] = item.CFrame
+		local tipVel, angVelY = getLaserMotion(item, oldCF, dt)
+		lastLaserAngVel[item]  = angVelY           -- FIX 3: persist angular velocity
+		local speed = tipVel.Magnitude
 
-		if worldDist>RESET_WORLD_DIST then
+		if worldDist > RESET_WORLD_DIST then
 			laserPassedFlag[item]=false; lastLaserSide[item]=nil; continue
 		end
 
+		-- Passed detection
 		if not laserPassedFlag[item] then
 			if speed>LASER_MOVE_THRESHOLD then
 				local toP=Vector3.new(playerPos.X-item.Position.X,0,playerPos.Z-item.Position.Z)
-				local fv=Vector3.new(tipVel.X,0,tipVel.Z)
+				local fv =Vector3.new(tipVel.X,0,tipVel.Z)
 				local dot=toP.Magnitude>0.01 and fv:Dot(toP.Unit) or 0
 				if dot<-0.3 and localZ<PASS_CONFIRM_DIST then
 					laserPassedFlag[item]=true
@@ -423,6 +435,12 @@ local function collectThreats(dt, now)
 
 		lastLaserSide[item]=currentSide
 		if laserPassedFlag[item] then continue end
+
+		-- FIX 2: add to viz list regardless of AGGRO_DISTANCE
+		if worldDist<=VIZ_RANGE then
+			table.insert(vizLasers, {laser=item, velocity=tipVel, angVelY=angVelY, objPos=objPos, side=currentSide})
+		end
+
 		if localZ>AGGRO_DISTANCE then continue end
 
 		local tti=speed>0.1 and (localZ/speed) or localZ
@@ -430,13 +448,13 @@ local function collectThreats(dt, now)
 
 		table.insert(threats, {
 			laser=item, localZ=localZ, tti=tti,
-			velocity=tipVel, objPos=objPos,
+			velocity=tipVel, angVelY=angVelY, objPos=objPos,
 			side=currentSide, worldDist=worldDist, speed=speed,
 		})
 	end
 
 	if sp then lastDebugPrint=now end
-	return threats
+	return threats, vizLasers
 end
 
 -- ==========================================
@@ -461,63 +479,40 @@ local function findCrossing(threats)
 end
 
 -- ==========================================
--- LOOKAHEAD PLANNER
--- Simulates PLAN_STEPS jumps ahead, returns waypoints table
+-- LOOKAHEAD PLANNER  (FIX 3: uses corrected predictArc)
 -- ==========================================
 local function runPlanner(threats)
 	if #threats==0 then return nil end
-
 	local jp, tAir, g, ws = getJumpPhysics()
 	local waypoints = {}
 	local simPos    = rootPart.Position
-	local timeAcc   = 0   -- total simulated time elapsed
+	local timeAcc   = 0
 
-	-- Only use threats as "live" laser references
-	local allLasers = {}
-	local allVels   = {}
+	local allLasers={};  local allVels={};  local allAngVels={}
 	for _,t in ipairs(threats) do
-		table.insert(allLasers, t.laser)
-		table.insert(allVels,   t.velocity)
+		table.insert(allLasers,  t.laser)
+		table.insert(allVels,    t.velocity)
+		table.insert(allAngVels, t.angVelY)
 	end
 
-	for step = 1, PLAN_STEPS do
-		-- Build list of lasers that will still be relevant at this point in time
-		local stepLasers = allLasers
-		local stepVels   = allVels
+	for step=1,PLAN_STEPS do
+		local bestScore=-math.huge; local bestLand=nil
 
-		-- Try PLAN_CANDIDATES directions (spread around forward)
-		local bestDir   = nil
-		local bestScore = -math.huge
-		local bestLandPos = nil
-
-		for ci = 0, PLAN_CANDIDATES-1 do
-			-- Sample directions in a circle
-			local angle = (ci / PLAN_CANDIDATES) * math.pi * 2
+		for ci=0,PLAN_CANDIDATES-1 do
+			local angle = (ci/PLAN_CANDIDATES)*math.pi*2
 			local dir   = Vector3.new(math.cos(angle), 0, math.sin(angle))
-
-			-- Check arc from simPos in this direction against all lasers at timeAcc offset
-			local safe, gap = predictArc(stepLasers, stepVels, dir, simPos, false, timeAcc)
-
+			local safe,gap = predictArc(allLasers, allVels, allAngVels, dir, simPos, false, timeAcc)
 			if safe then
-				-- Score: prefer directions toward map center + larger gap
-				local landPos=Vector3.new(simPos.X+dir.X*ws*tAir, simPos.Y, simPos.Z+dir.Z*ws*tAir)
-				landPos = clampToSafe(landPos)
-				local toCentre=(mapCenter-landPos).Magnitude
-				local score=gap - toCentre*0.1
-				if score>bestScore then
-					bestScore=score; bestDir=dir; bestLandPos=landPos
-				end
+				local landPos=clampToSafe(Vector3.new(simPos.X+dir.X*ws*tAir, simPos.Y, simPos.Z+dir.Z*ws*tAir))
+				local score=gap - (mapCenter-landPos).Magnitude*0.1
+				if score>bestScore then bestScore=score; bestLand=landPos end
 			end
 		end
 
-		if not bestLandPos then
-			-- No safe direction found at this step, stop planning here
-			break
-		end
-
-		table.insert(waypoints, bestLandPos)
-		simPos   = bestLandPos
-		timeAcc  = timeAcc + tAir + 0.1  -- 0.1s landing buffer
+		if not bestLand then break end
+		table.insert(waypoints, bestLand)
+		simPos  = bestLand
+		timeAcc = timeAcc + tAir + 0.1
 	end
 
 	return #waypoints>0 and {waypoints=waypoints} or nil
@@ -528,11 +523,10 @@ end
 -- ==========================================
 RunService.Heartbeat:Connect(function(dt)
 	if not character or humanoid.Health<=0 then
-		hideAll(); setStatus("\xe2\x97\x89 Dead",Color3.fromRGB(255,80,80))
-		return
+		hideAll(); setStatus("\xe2\x97\x89 Dead",Color3.fromRGB(255,80,80)); return
 	end
 
-	local now = tick()
+	local now=tick()
 
 	if not checkOnArena() then
 		hideAll()
@@ -544,7 +538,6 @@ RunService.Heartbeat:Connect(function(dt)
 	timerLabel.Text=string.format("\xe2\x8f\xb1  %.1fs",now-runStart)
 	jumpLabel.Text =string.format("\xf0\x9f\xa6\x98 Jumps: %d",jumpCount)
 
-	-- Position-delta move dir
 	local realMoveDir=Vector3.zero
 	if lastRootPos then
 		local flat=Vector3.new(rootPart.Position.X-lastRootPos.X,0,rootPart.Position.Z-lastRootPos.Z)
@@ -552,41 +545,49 @@ RunService.Heartbeat:Connect(function(dt)
 	end
 	lastRootPos=rootPart.Position
 
-	local threats=collectThreats(dt,now)
+	-- FIX 2: collect both threat list AND wide viz list
+	local threats, vizLasers = collectThreats(dt,now)
+
 	local state  =humanoid:GetState()
 	local isInAir=state==Enum.HumanoidStateType.Freefall
-	          or state==Enum.HumanoidStateType.Jumping
+	           or state==Enum.HumanoidStateType.Jumping
 	local canJump=(now-lastJumpTime)>=JUMP_COOLDOWN
 
-	-- Track when we left the ground
-	if isInAir and jumpStartTime==0 then
-		jumpStartTime=now
-	end
-	if not isInAir then
-		jumpStartTime=0; didAirdash=false
-	end
+	if isInAir and jumpStartTime==0 then jumpStartTime=now end
+	if not isInAir then jumpStartTime=0; didAirdash=false end
 
-	-- Dash label update
 	local dashReady = not didAirdash and isInAir
 		and (now-jumpStartTime)>=AIRDASH_CHECK_START
 		and (now-lastAirdashTime)>=AIRDASH_COOLDOWN
 	dashLabel.Text = dashReady
 		and "\xe2\x9a\xa1 Dash: READY"
-		or  "\xe2\x9a\xa1 Dash: " .. (didAirdash and "used" or "wait")
+		or  "\xe2\x9a\xa1 Dash: "..(didAirdash and "used" or "wait")
 	dashLabel.TextColor3 = dashReady
-		and Color3.fromRGB(255,100,200)
-		or  Color3.fromRGB(120,120,120)
+		and Color3.fromRGB(255,100,200) or Color3.fromRGB(120,120,120)
+
+	-- FIX 2: always show arc for any laser in VIZ_RANGE, even if not yet a threat
+	if #vizLasers>0 then
+		local vL={};  local vV={};  local vA={}
+		for _,v in ipairs(vizLasers) do
+			table.insert(vL, v.laser)
+			table.insert(vV, v.velocity)
+			table.insert(vA, v.angVelY)
+		end
+		predictArc(vL, vV, vA, realMoveDir, nil, true, 0)
+	else
+		hideArc()
+	end
 
 	if #threats==0 then
-		hideAll()
+		hidePlan()
 		crossLabel.Text="\xe2\x9c\x96 No crossing"
 		crossLabel.TextColor3=Color3.fromRGB(120,200,255)
 		setStatus("\xe2\x97\x89 Safe \xe2\x80\x93 holding centre",Color3.fromRGB(80,220,160))
 		if not isInAir then humanoid:MoveTo(mapCenter) end
-		currentPlan=nil; hidePlan(); return
+		currentPlan=nil; return
 	end
 
-	-- ---- CROSSING ----
+	-- Crossing
 	local crossPoint,crossA,crossB=findCrossing(threats)
 	local isCrossing=crossPoint~=nil
 	if isCrossing then
@@ -599,39 +600,28 @@ RunService.Heartbeat:Connect(function(dt)
 		crossMarker.Transparency=1
 	end
 
-	-- ---- PRIMARY THREAT ----
 	table.sort(threats,function(a,b) return a.tti<b.tti end)
 	local primary=threats[1]
 
-	-- ---- PLANNER (re-plan on interval) ----
+	-- Planner
 	if now-lastPlanTime>=PLAN_INTERVAL then
-		lastPlanTime=now
-		currentPlan=runPlanner(threats)
+		lastPlanTime=now; currentPlan=runPlanner(threats)
 	end
-	if currentPlan then
-		showPlanViz(currentPlan.waypoints)
-	else
-		hidePlan()
-	end
+	if currentPlan then showPlanViz(currentPlan.waypoints) else hidePlan() end
 
-	-- ---- AIR-DASH ----
+	-- Air-dash
 	if isInAir and dashReady and #threats>0 then
-		-- Check if primary laser is going to intersect current arc
-		local chkL={primary.laser}; local chkV={primary.velocity}
-		local airSafe,_ = predictArc(chkL,chkV,realMoveDir,nil,false,0)
+		local chkL={primary.laser}; local chkV={primary.velocity}; local chkA={primary.angVelY}
+		local airSafe,_ = predictArc(chkL,chkV,chkA,realMoveDir,nil,false,0)
 		if not airSafe then
-			-- Laser will hit us mid-air - fire airdash
-			-- Find a safe lateral direction
 			local dashTarget=nil
 			local fwd=realMoveDir.Magnitude>0.01 and realMoveDir or rootPart.CFrame.LookVector
 			fwd=Vector3.new(fwd.X,0,fwd.Z).Unit
 			local right=Vector3.new(fwd.Z,0,-fwd.X)
-			for _,testDir in ipairs({fwd, right, -right, -fwd,
-				(fwd+right).Unit, (fwd-right).Unit, (-fwd+right).Unit, (-fwd-right).Unit}) do
-				local safe2,_ = predictArc(chkL,chkV,testDir,rootPart.Position,false,0)
+			for _,testDir in ipairs({right,-right,fwd,-fwd,(fwd+right).Unit,(fwd-right).Unit,(-fwd+right).Unit,(-fwd-right).Unit}) do
+				local safe2,_ = predictArc(chkL,chkV,chkA,testDir,rootPart.Position,false,0)
 				if safe2 then
-					dashTarget=clampToSafe(rootPart.Position+testDir*15)
-					break
+					dashTarget=clampToSafe(rootPart.Position+testDir*15); break
 				end
 			end
 			if dashTarget then
@@ -642,49 +632,45 @@ RunService.Heartbeat:Connect(function(dt)
 				setStatus("\xe2\x97\x89 AIR DASH!",Color3.fromRGB(255,100,200))
 			end
 		end
-		hideArc(); return
+		return
 	end
 
 	if isInAir then
-		-- Normal in-air: keep heading to target
 		if currentPlan and currentPlan.waypoints[1] then
 			humanoid:MoveTo(currentPlan.waypoints[1])
 		else
-			local farSide=primary.laser.CFrame*Vector3.new(primary.objPos.X,0,-primary.side*15)
-			humanoid:MoveTo(clampToSafe(farSide))
+			humanoid:MoveTo(clampToSafe(farSideTarget(primary.laser, primary.objPos, primary.side)))
 		end
-		hideArc(); return
+		return
 	end
 
-	-- ---- ON GROUND: build jump target ----
+	-- On ground: pick jump target
 	local jumpTarget
-	local checkLasers={};  local checkVels={}
+	local checkLasers={};  local checkVels={};  local checkAngVels={}
 
 	if isCrossing then
 		local toC=Vector3.new(crossPoint.X-rootPart.Position.X,0,crossPoint.Z-rootPart.Position.Z)
 		if toC.Magnitude>0.01 then toC=toC.Unit end
-		jumpTarget=Vector3.new(crossPoint.X+toC.X*CROSS_OVERSHOOT,crossPoint.Y,crossPoint.Z+toC.Z*CROSS_OVERSHOOT)
-		table.insert(checkLasers,crossA.laser); table.insert(checkVels,crossA.velocity)
-		table.insert(checkLasers,crossB.laser); table.insert(checkVels,crossB.velocity)
+		jumpTarget=Vector3.new(crossPoint.X+toC.X*CROSS_OVERSHOOT, ARENA_TOP+0.5, crossPoint.Z+toC.Z*CROSS_OVERSHOOT)
+		table.insert(checkLasers,crossA.laser);  table.insert(checkVels,crossA.velocity);  table.insert(checkAngVels,crossA.angVelY)
+		table.insert(checkLasers,crossB.laser);  table.insert(checkVels,crossB.velocity);  table.insert(checkAngVels,crossB.angVelY)
 	elseif currentPlan and currentPlan.waypoints[1] then
-		-- Use planner first waypoint
 		jumpTarget=currentPlan.waypoints[1]
-		table.insert(checkLasers,primary.laser); table.insert(checkVels,primary.velocity)
+		table.insert(checkLasers,primary.laser); table.insert(checkVels,primary.velocity); table.insert(checkAngVels,primary.angVelY)
 	else
-		jumpTarget=primary.laser.CFrame*Vector3.new(primary.objPos.X,0,-primary.side*15)
-		table.insert(checkLasers,primary.laser); table.insert(checkVels,primary.velocity)
+		-- FIX 1: use farSideTarget instead of CFrame * Vector3
+		jumpTarget=farSideTarget(primary.laser, primary.objPos, primary.side)
+		table.insert(checkLasers,primary.laser); table.insert(checkVels,primary.velocity); table.insert(checkAngVels,primary.angVelY)
 	end
 
 	local toTgt=jumpTarget-rootPart.Position
 	local flatTgt=Vector3.new(toTgt.X,0,toTgt.Z)
 	local predictDir=flatTgt.Magnitude>0.01 and flatTgt.Unit or realMoveDir
 
-	-- Fast-laser early trigger: use TTI instead of distance
-	local triggerNow = canJump and
-		(primary.localZ<=JUMP_TRIGGER_DISTANCE or primary.tti<=FAST_TTI)
+	local triggerNow = canJump and (primary.localZ<=JUMP_TRIGGER_DISTANCE or primary.tti<=FAST_TTI)
 
 	if triggerNow then
-		local safe,gap=predictArc(checkLasers,checkVels,predictDir,nil,true,0)
+		local safe,gap=predictArc(checkLasers,checkVels,checkAngVels,predictDir,nil,true,0)
 		if safe then
 			print(string.format("[JUMP%s] '%s' lZ=%.2f TTI=%.2f gap=%.2f",
 				isCrossing and "(X)" or "", primary.laser.Name, primary.localZ, primary.tti, gap or 0))
@@ -692,21 +678,15 @@ RunService.Heartbeat:Connect(function(dt)
 			jumpLabel.Text=string.format("\xf0\x9f\xa6\x98 Jumps: %d",jumpCount)
 			humanoid:MoveTo(clampToSafe(jumpTarget))
 			humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-			setStatus(isCrossing and "\xe2\x97\x89 CROSSING JUMP!" or "\xe2\x97\x89 Jumping!",
-				Color3.fromRGB(60,220,100))
+			setStatus(isCrossing and "\xe2\x97\x89 CROSSING JUMP!" or "\xe2\x97\x89 Jumping!", Color3.fromRGB(60,220,100))
 		else
-			-- Stand still - let laser come, keep arc live
-			predictArc(checkLasers,checkVels,predictDir,nil,true,0)
 			setStatus("\xe2\x97\x89 Waiting for safe arc\xe2\x80\xa6",Color3.fromRGB(255,120,40))
 		end
-
 	elseif primary.localZ<=APPROACH_START then
 		humanoid:MoveTo(clampToSafe(jumpTarget))
 		setStatus("\xe2\x97\x89 Approaching",Color3.fromRGB(255,180,40))
-		predictArc(checkLasers,checkVels,predictDir,nil,true,0)
 	else
 		humanoid:MoveTo(mapCenter)
-		hideArc()
 		setStatus("\xe2\x97\x89 Holding centre",Color3.fromRGB(140,180,255))
 	end
 end)
