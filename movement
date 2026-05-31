@@ -1,3 +1,8 @@
+-- ==========================================
+-- MOVEMENT SCRIPT v4
+-- ==========================================
+print("[Movement] v4 loaded")
+
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 
@@ -18,10 +23,7 @@ local AGGRO_DISTANCE = 15
 local CLEARANCE_DISTANCE = 6
 local JUMP_COOLDOWN = 0.1
 
--- THE FIX: Track each laser's previous CFrame to measure its OWN movement
--- We measure from a FROZEN reference point (the laser's previous position against the map center)
--- This means your character's walking speed does NOT affect the velocity reading at all
-local lastLaserCFrames = setmetatable({}, {__mode = "k"})
+local lastLaserPositions = setmetatable({}, {__mode = "k"})
 local lastJumpTime = 0
 
 -- ==========================================
@@ -138,34 +140,28 @@ local function getClosestLaser(dt)
 			local currentSide = math.sign(objPos.Z)
 			if currentSide == 0 then currentSide = 1 end
 
-			local oldCFrame = lastLaserCFrames[item]
-			lastLaserCFrames[item] = item.CFrame
+			local oldPos = lastLaserPositions[item]
+			lastLaserPositions[item] = item.Position
 
 			local currentVel = Vector3.zero
 			local isMovingAway = false
 
-			if oldCFrame then
-				-- CORE FIX: Measure the laser's movement against the MAP CENTER (a frozen point)
-				-- This is 100% independent of where the player is walking.
-				-- If the laser is moving away from the map center in the direction of the player,
-				-- it means the laser is moving away from the player regardless of player movement.
-				local oldDistToCenter = math.abs(oldCFrame:PointToObjectSpace(mapCenter).Z)
-				local newDistToCenter = math.abs(item.CFrame:PointToObjectSpace(mapCenter).Z)
+			if oldPos then
+				-- Pure world-space velocity of the laser itself (completely ignores player movement)
+				currentVel = (item.Position - oldPos) / dt
 
-				-- The laser's own velocity in world space (studs per second)
-				currentVel = (item.CFrame.Position - oldCFrame.Position) / dt
+				-- Direction from laser to player, flat (Y ignored)
+				local toPlayer = Vector3.new(playerPos.X - item.Position.X, 0, playerPos.Z - item.Position.Z)
 
-				-- Check: is the laser sweeping outward (away from map center = away from player)?
-				-- We also verify the player is on the same side as the outward direction
-				local laserMovingOutward = (newDistToCenter > oldDistToCenter + 0.005)
-				
-				-- Only flag as moving away if the laser is heading in the direction AWAY from the player
-				-- i.e., the laser is on the same side as the player AND moving outward
-				if laserMovingOutward then
-					-- Extra confirmation: check if the laser's outward direction matches the player's side
-					local velInLaserSpace = item.CFrame:VectorToObjectSpace(currentVel)
-					-- If the laser velocity Z component matches the player's side sign, it's truly moving away
-					if math.sign(velInLaserSpace.Z) == currentSide then
+				if toPlayer.Magnitude > 0.01 then
+					local toPlayerUnit = toPlayer.Unit
+					local flatVel = Vector3.new(currentVel.X, 0, currentVel.Z)
+					
+					-- Dot product: positive = laser moving TOWARD player, negative = moving AWAY
+					local dot = flatVel:Dot(toPlayerUnit)
+					
+					-- Only mark as moving away if it has meaningful speed away (> 0.05 studs/s)
+					if dot < -0.05 then
 						isMovingAway = true
 					end
 				end
@@ -174,9 +170,11 @@ local function getClosestLaser(dt)
 			local isEscaping = false
 			if isMovingAway then
 				if distToLine < CLEARANCE_DISTANCE then
+					-- Still too close to the back, keep walking away
 					isEscaping = true
 				else
-					continue -- Far enough and moving away, ignore completely
+					-- Far enough and moving away: ignore this laser entirely
+					continue
 				end
 			end
 
@@ -185,7 +183,7 @@ local function getClosestLaser(dt)
 				closestLaser = item
 				laserVelocity = currentVel
 
-				-- Hard rule: NEVER allow jump if the laser is moving away from us
+				-- NEVER jump if laser is moving away
 				canJumpClosest = not isMovingAway
 
 				local targetSide = isEscaping and currentSide or -currentSide
@@ -209,7 +207,7 @@ RunService.Heartbeat:Connect(function(dt)
 	local currentState = humanoid:GetState()
 	local isInAir = (currentState == Enum.HumanoidStateType.Freefall or currentState == Enum.HumanoidStateType.Jumping)
 
-	-- Hard-lock canJump for 0.1s after every jump
+	-- Hard-lock canJump for JUMP_COOLDOWN seconds after every jump
 	if (now - lastJumpTime) < JUMP_COOLDOWN then
 		canJump = false
 	end
