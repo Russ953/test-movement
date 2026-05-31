@@ -10,217 +10,220 @@ local mapPart = workspace:WaitForChild("Laser Game Map"):WaitForChild("Cylinder.
 local lasersFolder = workspace:WaitForChild("Lasers"):WaitForChild("ActiveLasers")
 
 local maxMapDimension = math.max(mapPart.Size.X, mapPart.Size.Y, mapPart.Size.Z)
-local safeRadius = (maxMapDimension / 2) - 5 
+local safeRadius = (maxMapDimension / 2) - 5
 local mapCenter = mapPart.Position
 
 local JUMP_TRIGGER_DISTANCE = 5.5
-local AGGRO_DISTANCE = 15 
-local CLEARANCE_DISTANCE = 6 
+local AGGRO_DISTANCE = 15
+local CLEARANCE_DISTANCE = 6
+local JUMP_COOLDOWN = 0.1 -- Seconds to pause after a jump before re-evaluating
 
--- The only memory we need now is to track speed.
+-- Velocity tracking and jump cooldown
 local lastLaserCFrames = setmetatable({}, {__mode = "k"})
+local lastLaserDistances = setmetatable({}, {__mode = "k"}) -- track raw perpendicular distance per laser
+local lastJumpTime = 0
 
 -- ==========================================
 -- ARC VISUALIZER SETUP
 -- ==========================================
 local vizFolder = workspace:FindFirstChild("JumpArcVisualizer")
 if not vizFolder then
-    vizFolder = Instance.new("Folder")
-    vizFolder.Name = "JumpArcVisualizer"
-    vizFolder.Parent = workspace
+	vizFolder = Instance.new("Folder")
+	vizFolder.Name = "JumpArcVisualizer"
+	vizFolder.Parent = workspace
 end
 
 local vizParts = {}
 for i = 1, 15 do
-    local p = Instance.new("Part")
-    p.Size = Vector3.new(0.4, 0.4, 0.4)
-    p.Anchored = true
-    p.CanCollide = false
-    p.Material = Enum.Material.Neon
-    p.Shape = Enum.PartType.Ball
-    p.Transparency = 1 
-    p.Parent = vizFolder
-    vizParts[i] = p
+	local p = Instance.new("Part")
+	p.Size = Vector3.new(0.4, 0.4, 0.4)
+	p.Anchored = true
+	p.CanCollide = false
+	p.Material = Enum.Material.Neon
+	p.Shape = Enum.PartType.Ball
+	p.Transparency = 1
+	p.Parent = vizFolder
+	vizParts[i] = p
 end
 
 local function hideVisualizer()
-    for _, p in ipairs(vizParts) do
-        p.Transparency = 1
-    end
+	for _, p in ipairs(vizParts) do
+		p.Transparency = 1
+	end
 end
 
 -- ==========================================
 -- KINEMATIC TRAJECTORY PREDICTION
 -- ==========================================
 local function predictJumpSafety(laser, laserVelocity)
-    if not laser then return false end
-    
-    local g = workspace.Gravity
-    local jumpPower = humanoid.UseJumpPower and humanoid.JumpPower or math.sqrt(2 * g * humanoid.JumpHeight)
-    local walkSpeed = humanoid.WalkSpeed
-    
-    local moveDir = humanoid.MoveDirection
-    if moveDir.Magnitude == 0 then moveDir = rootPart.CFrame.LookVector end
-    
-    local timeInAir = (2 * jumpPower) / g
-    local steps = 15
-    local timeStep = timeInAir / steps
-    
-    local startPos = rootPart.Position
-    local isSafe = true
-    
-    for i = 1, steps do
-        local t = i * timeStep
-        
-        local pX = startPos.X + (moveDir.X * walkSpeed * t)
-        local pZ = startPos.Z + (moveDir.Z * walkSpeed * t)
-        local pY = startPos.Y + (jumpPower * t) - (0.5 * g * t * t)
-        local trajectoryPoint = Vector3.new(pX, pY, pZ)
-        
-        local futureLaserPos = laser.Position + (laserVelocity * t)
-        local futureLaserCFrame = laser.CFrame - laser.Position + futureLaserPos
-        
-        local localPoint = futureLaserCFrame:PointToObjectSpace(trajectoryPoint)
-        
-        local boundX = (laser.Size.X / 2) + 1.2
-        local boundY = (laser.Size.Y / 2) + 2.6
-        local boundZ = (laser.Size.Z / 2) + 1.2
-        
-        if math.abs(localPoint.X) < boundX and math.abs(localPoint.Y) < boundY and math.abs(localPoint.Z) < boundZ then
-            isSafe = false
-        end
-        
-        vizParts[i].Position = trajectoryPoint
-        vizParts[i].Transparency = 0
-    end
-    
-    local arcColor = isSafe and Color3.new(0, 1, 0) or Color3.new(1, 0, 0)
-    for i = 1, steps do
-        vizParts[i].Color = arcColor
-    end
-    
-    return isSafe
+	if not laser then return false end
+
+	local g = workspace.Gravity
+	local jumpPower = humanoid.UseJumpPower and humanoid.JumpPower or math.sqrt(2 * g * humanoid.JumpHeight)
+	local walkSpeed = humanoid.WalkSpeed
+
+	local moveDir = humanoid.MoveDirection
+	if moveDir.Magnitude == 0 then moveDir = rootPart.CFrame.LookVector end
+
+	local timeInAir = (2 * jumpPower) / g
+	local steps = 15
+	local timeStep = timeInAir / steps
+
+	local startPos = rootPart.Position
+	local isSafe = true
+
+	for i = 1, steps do
+		local t = i * timeStep
+
+		local pX = startPos.X + (moveDir.X * walkSpeed * t)
+		local pZ = startPos.Z + (moveDir.Z * walkSpeed * t)
+		local pY = startPos.Y + (jumpPower * t) - (0.5 * g * t * t)
+		local trajectoryPoint = Vector3.new(pX, pY, pZ)
+
+		local futureLaserPos = laser.Position + (laserVelocity * t)
+		local futureLaserCFrame = laser.CFrame - laser.Position + futureLaserPos
+
+		local localPoint = futureLaserCFrame:PointToObjectSpace(trajectoryPoint)
+
+		local boundX = (laser.Size.X / 2) + 1.2
+		local boundY = (laser.Size.Y / 2) + 2.6
+		local boundZ = (laser.Size.Z / 2) + 1.2
+
+		if math.abs(localPoint.X) < boundX and math.abs(localPoint.Y) < boundY and math.abs(localPoint.Z) < boundZ then
+			isSafe = false
+		end
+
+		vizParts[i].Position = trajectoryPoint
+		vizParts[i].Transparency = 0
+	end
+
+	local arcColor = isSafe and Color3.new(0, 1, 0) or Color3.new(1, 0, 0)
+	for i = 1, steps do
+		vizParts[i].Color = arcColor
+	end
+
+	return isSafe
 end
 
 -- ==========================================
 -- MAIN LOGIC
 -- ==========================================
 local function clampToSafeZone(targetPos)
-    local offset = targetPos - mapCenter
-    local flatOffset = Vector3.new(offset.X, 0, offset.Z)
-    if flatOffset.Magnitude > safeRadius then
-        local clampedFlat = flatOffset.Unit * safeRadius
-        return Vector3.new(mapCenter.X + clampedFlat.X, targetPos.Y, mapCenter.Z + clampedFlat.Z)
-    end
-    return targetPos
+	local offset = targetPos - mapCenter
+	local flatOffset = Vector3.new(offset.X, 0, offset.Z)
+	if flatOffset.Magnitude > safeRadius then
+		local clampedFlat = flatOffset.Unit * safeRadius
+		return Vector3.new(mapCenter.X + clampedFlat.X, targetPos.Y, mapCenter.Z + clampedFlat.Z)
+	end
+	return targetPos
 end
 
 local function getClosestLaser(dt)
-    local closestLaser = nil
-    local minDistance = math.huge
-    local closestTargetPos = nil
-    local laserVelocity = Vector3.zero
-    local canJumpClosest = false
-    
-    local playerPos = rootPart.Position
-    
-    for _, item in ipairs(lasersFolder:GetChildren()) do
-        if item:IsA("BasePart") then
-            item.CanCollide = false 
-            
-            local objPos = item.CFrame:PointToObjectSpace(playerPos)
-            local distToLine = math.abs(objPos.Z)
-            
-            local currentSide = math.sign(objPos.Z)
-            if currentSide == 0 then currentSide = 1 end
-            
-            -- True Velocity check
-            local oldCFrame = lastLaserCFrames[item]
-            lastLaserCFrames[item] = item.CFrame
-            
-            local laserMoveDirection = 0
-            local currentVel = Vector3.zero
-            
-            if oldCFrame then
-                local movementVector = item.CFrame.Position - oldCFrame.Position
-                currentVel = movementVector / dt
-                local localMovement = item.CFrame:VectorToObjectSpace(movementVector)
-                
-                if math.abs(localMovement.Z) > 0.005 then
-                    laserMoveDirection = math.sign(localMovement.Z)
-                end
-            end
-            
-            -- Determine the "Danger Zone" (Front) and "Safe Zone" (Back)
-            local isFrontSide = true
-            if laserMoveDirection ~= 0 then
-                isFrontSide = (currentSide == laserMoveDirection)
-            end
-            
-            -- If we are on the back side, the laser is moving away. 
-            local isEscaping = false
-            if not isFrontSide then
-                if distToLine < CLEARANCE_DISTANCE then
-                    -- We are too close to the back of the laser, keep walking away to ensure 6 studs clearance!
-                    isEscaping = true
-                else
-                    -- We are safe and far enough away. Ignore this laser entirely.
-                    continue
-                end
-            end
-            
-            -- Track closest active threat
-            if distToLine < minDistance then
-                minDistance = distToLine
-                closestLaser = item
-                laserVelocity = currentVel
-                
-                -- Only allow jumping if we are in FRONT of the laser. Never jump from behind.
-                canJumpClosest = isFrontSide 
-                
-                -- If we are in front, walk past it (-currentSide). If escaping, keep walking away (currentSide).
-                local targetSide = isEscaping and currentSide or -currentSide
-                local walkThroughZ = targetSide * 15
-                closestTargetPos = item.CFrame * Vector3.new(objPos.X, 0, walkThroughZ)
-            end
-        end
-    end
-    
-    return closestLaser, closestTargetPos, minDistance, laserVelocity, canJumpClosest
+	local closestLaser = nil
+	local minDistance = math.huge
+	local closestTargetPos = nil
+	local laserVelocity = Vector3.zero
+	local canJumpClosest = false
+
+	local playerPos = rootPart.Position
+
+	for _, item in ipairs(lasersFolder:GetChildren()) do
+		if item:IsA("BasePart") then
+			item.CanCollide = false
+
+			local objPos = item.CFrame:PointToObjectSpace(playerPos)
+			local distToLine = math.abs(objPos.Z)
+
+			local currentSide = math.sign(objPos.Z)
+			if currentSide == 0 then currentSide = 1 end
+
+			local oldCFrame = lastLaserCFrames[item]
+			lastLaserCFrames[item] = item.CFrame
+
+			-- FIX: Use raw world-space distance delta instead of localMovement.Z
+			-- This is immune to rotation wobble and gives a true "closer or further" reading
+			local prevDist = lastLaserDistances[item] or distToLine
+			lastLaserDistances[item] = distToLine
+			local distanceDelta = distToLine - prevDist -- Positive = moving away, Negative = moving closer
+
+			local currentVel = Vector3.zero
+			if oldCFrame then
+				currentVel = (item.CFrame.Position - oldCFrame.Position) / dt
+			end
+
+			-- If distance is actively growing, the laser is moving away from us
+			local isMovingAway = distanceDelta > 0.01
+
+			local isEscaping = false
+			if isMovingAway then
+				if distToLine < CLEARANCE_DISTANCE then
+					-- Too close to the back side, keep walking away until we hit clearance
+					isEscaping = true
+				else
+					-- Far enough away and moving away, ignore completely
+					continue
+				end
+			end
+
+			if distToLine < minDistance then
+				minDistance = distToLine
+				closestLaser = item
+				laserVelocity = currentVel
+
+				-- Hard rule: only allow jump if laser is approaching us, NEVER if it's moving away
+				canJumpClosest = not isMovingAway
+
+				local targetSide = isEscaping and currentSide or -currentSide
+				local walkThroughZ = targetSide * 15
+				closestTargetPos = item.CFrame * Vector3.new(objPos.X, 0, walkThroughZ)
+			end
+		end
+	end
+
+	return closestLaser, closestTargetPos, minDistance, laserVelocity, canJumpClosest
 end
 
 RunService.Heartbeat:Connect(function(dt)
-    if not character or humanoid.Health <= 0 then 
-        hideVisualizer()
-        return 
-    end
-    
-    local laser, targetPos, dist, laserVelocity, canJump = getClosestLaser(dt)
-    local currentState = humanoid:GetState()
-    local isInAir = (currentState == Enum.HumanoidStateType.Freefall or currentState == Enum.HumanoidStateType.Jumping)
-    
-    if laser and targetPos then
-        if dist <= AGGRO_DISTANCE then
-            local safeTarget = clampToSafeZone(targetPos)
-            humanoid:MoveTo(safeTarget)
-            
-            if canJump and dist <= JUMP_TRIGGER_DISTANCE + 5 and not isInAir then
-                local jumpIsSafe = predictJumpSafety(laser, laserVelocity)
-                
-                if dist <= JUMP_TRIGGER_DISTANCE and jumpIsSafe then
-                    humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-                end
-            elseif isInAir or not canJump then
-                hideVisualizer()
-            end
-        else
-            hideVisualizer()
-            if not isInAir then humanoid:MoveTo(mapCenter) end
-        end
-    else
-        hideVisualizer()
-        if not isInAir then
-            humanoid:MoveTo(mapCenter)
-        end
-    end
+	if not character or humanoid.Health <= 0 then
+		hideVisualizer()
+		return
+	end
+
+	local now = tick()
+	local laser, targetPos, dist, laserVelocity, canJump = getClosestLaser(dt)
+	local currentState = humanoid:GetState()
+	local isInAir = (currentState == Enum.HumanoidStateType.Freefall or currentState == Enum.HumanoidStateType.Jumping)
+
+	-- Post-jump cooldown: hard-lock canJump for 0.1s after every jump
+	-- During this window the distanceDelta check has time to correctly classify
+	-- whether the laser is now retreating or still approaching
+	if (now - lastJumpTime) < JUMP_COOLDOWN then
+		canJump = false
+	end
+
+	if laser and targetPos then
+		if dist <= AGGRO_DISTANCE then
+			local safeTarget = clampToSafeZone(targetPos)
+			humanoid:MoveTo(safeTarget)
+
+			if canJump and dist <= JUMP_TRIGGER_DISTANCE + 5 and not isInAir then
+				local jumpIsSafe = predictJumpSafety(laser, laserVelocity)
+
+				if dist <= JUMP_TRIGGER_DISTANCE and jumpIsSafe then
+					lastJumpTime = now -- Record the exact time of the jump
+					humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+				end
+			elseif isInAir or not canJump then
+				hideVisualizer()
+			end
+		else
+			hideVisualizer()
+			if not isInAir then humanoid:MoveTo(mapCenter) end
+		end
+	else
+		hideVisualizer()
+		if not isInAir then
+			humanoid:MoveTo(mapCenter)
+		end
+	end
 end)
