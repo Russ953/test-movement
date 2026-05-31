@@ -1,28 +1,23 @@
 -- ==========================================
--- MOVEMENT SCRIPT v13
+-- MOVEMENT SCRIPT v14
 -- ==========================================
--- NEW in v13: CROSSING LASER DETECTION
+-- FIX in v14:
+--   v13 backed the player away from the laser when the arc was unsafe.
+--   This pushed them to the arena edge, then the laser was too far away
+--   to ever trigger JUMP_TRIGGER_DISTANCE, so the bot just fell off.
 --
---   When two lasers are both approaching and their paths cross near the
---   player, the script finds the world-space intersection point of the
---   two laser centre-lines and aims the jump over THAT point instead of
---   just past one laser. This clears both beams in a single jump.
---
---   How it works:
---   1. Collect all "threat" lasers (not passed, localZ < AGGRO_DISTANCE).
---   2. For every pair, call findLaserIntersection() which does a 2D
---      closest-approach on the two infinite lines defined by each
---      laser's position + forward vector.
---   3. If the intersection is within MAX_CROSS_DIST of the player AND
---      both lasers are within CROSS_BOTH_DIST, mark it as a crossing event.
---   4. The jump target is set to (intersection XZ) + offset away from the
---      player so the bot lands past BOTH beams.
---   5. Arc prediction is run against BOTH lasers and both must pass before
---      the jump fires.
---
--- All v12 fixes (position-delta move dir, backup on unsafe arc) kept.
+--   New behaviour:
+--   - When arc is unsafe: STAND STILL at current position and wait.
+--     The laser will come to the player. No more retreating to the wall.
+--   - Jump trigger is now purely "laser localZ <= JUMP_TRIGGER_DISTANCE".
+--     The player does NOT need to be walking toward the laser - the laser
+--     is moving toward the player, so just wait.
+--   - While waiting, keep running predictTrajectory every frame so the
+--     moment the arc clears (laser angle changes), the jump fires instantly.
+--   - Approach walk is still used when the laser is far away (> APPROACH_START)
+--     so the bot positions itself centrally before the laser arrives.
 -- ==========================================
-print("[Movement] v13 loaded")
+print("[Movement] v14 loaded")
 
 local Players    = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -43,19 +38,19 @@ local ARENA_Y_MARGIN  = 6
 local ARENA_XZ_RADIUS = (maxMapDimension / 2) + 4
 
 -- Tuning
-local JUMP_TRIGGER_DISTANCE = 5.5
+local JUMP_TRIGGER_DISTANCE = 5.5   -- laser localZ <= this  →  jump (if arc safe)
+local APPROACH_START        = 12    -- laser localZ <= this  →  start walking toward it
 local AGGRO_DISTANCE        = 18
 local JUMP_COOLDOWN         = 0.35
 local PASS_CONFIRM_DIST     = 8
 local LASER_MOVE_THRESHOLD  = 0.4
 local RESET_WORLD_DIST      = 22
 local TIGHT_CLEARANCE       = 1.8
-local BACKUP_DIST           = 12
 
 -- Crossing detection tuning
-local MAX_CROSS_DIST   = 14   -- intersection must be within this distance of the player
-local CROSS_BOTH_DIST  = 18   -- both lasers must be within this world distance
-local CROSS_OVERSHOOT  = 5    -- how far past the intersection to aim
+local MAX_CROSS_DIST  = 14
+local CROSS_BOTH_DIST = 18
+local CROSS_OVERSHOOT = 5
 
 -- State
 local lastLaserCFrames = setmetatable({}, {__mode = "k"})
@@ -67,7 +62,7 @@ local runStart         = tick()
 local lastRootPos      = nil
 
 local lastDebugPrint = 0
-local DEBUG_INTERVAL = 0.3
+local DEBUG_INTERVAL = 0.4
 
 -- ==========================================
 -- HUD
@@ -81,17 +76,17 @@ screenGui.Parent         = player.PlayerGui
 local hudFrame = Instance.new("Frame")
 hudFrame.Size                   = UDim2.new(0, 210, 0, 80)
 hudFrame.Position               = UDim2.new(1, -220, 0, 10)
-hudFrame.BackgroundColor3       = Color3.fromRGB(15, 15, 15)
+hudFrame.BackgroundColor3       = Color3.fromRGB(15,15,15)
 hudFrame.BackgroundTransparency = 0.35
 hudFrame.BorderSizePixel        = 0
 hudFrame.Parent                 = screenGui
 Instance.new("UICorner", hudFrame).CornerRadius = UDim.new(0, 8)
 
 local timerLabel = Instance.new("TextLabel")
-timerLabel.Size                  = UDim2.new(1, -10, 1/3, 0)
+timerLabel.Size                  = UDim2.new(1,-10, 1/3, 0)
 timerLabel.Position              = UDim2.new(0, 8, 0, 4)
 timerLabel.BackgroundTransparency = 1
-timerLabel.TextColor3            = Color3.fromRGB(80, 220, 160)
+timerLabel.TextColor3            = Color3.fromRGB(80,220,160)
 timerLabel.Font                  = Enum.Font.GothamBold
 timerLabel.TextSize              = 17
 timerLabel.TextXAlignment        = Enum.TextXAlignment.Left
@@ -99,10 +94,10 @@ timerLabel.Text                  = "\xe2\x8f\xb1  0.0s"
 timerLabel.Parent                = hudFrame
 
 local jumpLabel = Instance.new("TextLabel")
-jumpLabel.Size                   = UDim2.new(1, -10, 1/3, 0)
+jumpLabel.Size                   = UDim2.new(1,-10, 1/3, 0)
 jumpLabel.Position               = UDim2.new(0, 8, 1/3, 0)
 jumpLabel.BackgroundTransparency = 1
-jumpLabel.TextColor3             = Color3.fromRGB(255, 200, 60)
+jumpLabel.TextColor3             = Color3.fromRGB(255,200,60)
 jumpLabel.Font                   = Enum.Font.GothamBold
 jumpLabel.TextSize               = 15
 jumpLabel.TextXAlignment         = Enum.TextXAlignment.Left
@@ -110,10 +105,10 @@ jumpLabel.Text                   = "\xf0\x9f\xa6\x98 Jumps: 0"
 jumpLabel.Parent                 = hudFrame
 
 local crossLabel = Instance.new("TextLabel")
-crossLabel.Size                   = UDim2.new(1, -10, 1/3, 0)
+crossLabel.Size                   = UDim2.new(1,-10, 1/3, 0)
 crossLabel.Position               = UDim2.new(0, 8, 2/3, 0)
 crossLabel.BackgroundTransparency = 1
-crossLabel.TextColor3             = Color3.fromRGB(120, 200, 255)
+crossLabel.TextColor3             = Color3.fromRGB(120,200,255)
 crossLabel.Font                   = Enum.Font.Gotham
 crossLabel.TextSize               = 13
 crossLabel.TextXAlignment         = Enum.TextXAlignment.Left
@@ -121,8 +116,8 @@ crossLabel.Text                   = "\xe2\x9c\x96 No crossing"
 crossLabel.Parent                 = hudFrame
 
 local statusLabel = Instance.new("TextLabel")
-statusLabel.Size                  = UDim2.new(0, 210, 0, 24)
-statusLabel.Position              = UDim2.new(1, -220, 0, 94)
+statusLabel.Size                  = UDim2.new(0,210, 0, 24)
+statusLabel.Position              = UDim2.new(1,-220, 0, 94)
 statusLabel.BackgroundColor3      = Color3.fromRGB(15,15,15)
 statusLabel.BackgroundTransparency = 0.35
 statusLabel.BorderSizePixel       = 0
@@ -144,8 +139,8 @@ end
 -- ==========================================
 local vizFolder = workspace:FindFirstChild("JumpArcVisualizer")
 if not vizFolder then
-	vizFolder        = Instance.new("Folder")
-	vizFolder.Name   = "JumpArcVisualizer"
+	vizFolder = Instance.new("Folder")
+	vizFolder.Name = "JumpArcVisualizer"
 	vizFolder.Parent = workspace
 end
 
@@ -163,14 +158,13 @@ for i = 1, VIZ_STEPS do
 	vizParts[i]    = p
 end
 
--- Crossing marker (cyan sphere at intersection point)
 local crossMarker        = Instance.new("Part")
-crossMarker.Size         = Vector3.new(1, 1, 1)
+crossMarker.Size         = Vector3.new(1.5,1.5,1.5)
 crossMarker.Anchored     = true
 crossMarker.CanCollide   = false
 crossMarker.Material     = Enum.Material.Neon
 crossMarker.Shape        = Enum.PartType.Ball
-crossMarker.Color        = Color3.fromRGB(0, 220, 255)
+crossMarker.Color        = Color3.fromRGB(0,220,255)
 crossMarker.Transparency = 1
 crossMarker.Parent       = vizFolder
 
@@ -191,50 +185,38 @@ local function checkOnArena()
 end
 
 -- ==========================================
--- ANGULAR VELOCITY HELPER
+-- ANGULAR VELOCITY
 -- ==========================================
 local function getLaserTipVelocity(item, oldCF, dt)
 	if not oldCF then return Vector3.zero end
 	local transVel = (item.Position - oldCF.Position) / dt
-	local oldFwd   = Vector3.new(oldCF.LookVector.X,       0, oldCF.LookVector.Z)
+	local oldFwd   = Vector3.new(oldCF.LookVector.X, 0, oldCF.LookVector.Z)
 	local newFwd   = Vector3.new(item.CFrame.LookVector.X, 0, item.CFrame.LookVector.Z)
 	if oldFwd.Magnitude < 0.01 or newFwd.Magnitude < 0.01 then return transVel end
 	local cross    = oldFwd:Cross(newFwd)
 	local angSpeed = cross.Y / dt
 	local halfLen  = item.Size.Z / 2
 	local perpDir  = Vector3.new(newFwd.Z, 0, -newFwd.X) * math.sign(angSpeed + 1e-9)
-	local rotVel   = perpDir * math.abs(angSpeed) * halfLen
-	return transVel + rotVel
+	return transVel + perpDir * math.abs(angSpeed) * halfLen
 end
 
 -- ==========================================
 -- 2D LINE INTERSECTION (XZ plane)
--- Returns world XZ intersection point, or nil if lines are parallel.
--- Each laser's "line" = its Position as origin, LookVector as direction.
 -- ==========================================
 local function findLaserIntersection(laserA, laserB)
-	-- Parametric: P = A_pos + t * A_dir,  Q = B_pos + s * B_dir
-	local ax = laserA.Position.X;  local az = laserA.Position.Z
+	local ax  = laserA.Position.X;  local az  = laserA.Position.Z
 	local adx = laserA.CFrame.LookVector.X; local adz = laserA.CFrame.LookVector.Z
-	local bx = laserB.Position.X;  local bz = laserB.Position.Z
+	local bx  = laserB.Position.X;  local bz  = laserB.Position.Z
 	local bdx = laserB.CFrame.LookVector.X; local bdz = laserB.CFrame.LookVector.Z
-
-	-- Solve: ax + t*adx = bx + s*bdx
-	--        az + t*adz = bz + s*bdz
 	local denom = adx * bdz - adz * bdx
-	if math.abs(denom) < 0.01 then return nil end  -- parallel
-
+	if math.abs(denom) < 0.01 then return nil end
 	local dx = bx - ax;  local dz = bz - az
 	local t  = (dx * bdz - dz * bdx) / denom
-
-	local ix = ax + t * adx
-	local iz = az + t * adz
-	return Vector3.new(ix, ARENA_TOP + 0.5, iz), t
+	return Vector3.new(ax + t*adx, ARENA_TOP + 0.5, az + t*adz), t
 end
 
 -- ==========================================
--- TRAJECTORY PREDICTION (checks ALL passed lasers)
--- Returns: isSafe (bool), minGap (number)
+-- MULTI-LASER ARC PREDICTION
 -- ==========================================
 local function predictTrajectoryMulti(lasers, velocities, actualMoveDir)
 	if #lasers == 0 then return false, -1 end
@@ -253,40 +235,36 @@ local function predictTrajectoryMulti(lasers, velocities, actualMoveDir)
 	if moveDir.Magnitude > 0.01 then moveDir = moveDir.Unit end
 
 	local timeInAir = (2 * jumpPower) / g
-	local steps     = VIZ_STEPS
-	local timeStep  = timeInAir / steps
+	local timeStep  = timeInAir / VIZ_STEPS
 	local startPos  = rootPart.Position
 	local isSafe    = true
 	local minGap    = math.huge
 
-	for i = 1, steps do
+	for i = 1, VIZ_STEPS do
 		local t  = i * timeStep
 		local tp = Vector3.new(
 			startPos.X + moveDir.X * walkSpeed * t,
 			startPos.Y + jumpPower * t - 0.5 * g * t * t,
 			startPos.Z + moveDir.Z * walkSpeed * t
 		)
-
 		for li, laser in ipairs(lasers) do
 			local vel      = velocities[li]
 			local futureCF = laser.CFrame - laser.Position + (laser.Position + vel * t)
 			local lp       = futureCF:PointToObjectSpace(tp)
-			local bX = laser.Size.X / 2 + 1.2
-			local bY = laser.Size.Y / 2 + 2.6
-			local bZ = laser.Size.Z / 2 + 1.2
-
+			local bX = laser.Size.X/2 + 1.2
+			local bY = laser.Size.Y/2 + 2.6
+			local bZ = laser.Size.Z/2 + 1.2
 			if math.abs(lp.X) < bX and math.abs(lp.Y) < bY and math.abs(lp.Z) < bZ then
 				isSafe = false
 			end
-			local gap = math.min(bX - math.abs(lp.X), bY - math.abs(lp.Y), bZ - math.abs(lp.Z))
+			local gap = math.min(bX-math.abs(lp.X), bY-math.abs(lp.Y), bZ-math.abs(lp.Z))
 			minGap = math.min(minGap, math.abs(gap))
 		end
-
 		vizParts[i].Position     = tp
 		vizParts[i].Transparency = 0
 	end
 
-	-- Landing zone check against all lasers
+	-- Landing zone check
 	if isSafe then
 		local landT   = timeInAir
 		local landPos = Vector3.new(
@@ -298,22 +276,16 @@ local function predictTrajectoryMulti(lasers, velocities, actualMoveDir)
 			local vel      = velocities[li]
 			local futureCF = laser.CFrame - laser.Position + (laser.Position + vel * landT)
 			local lp       = futureCF:PointToObjectSpace(landPos)
-			if math.abs(lp.X) < laser.Size.X / 2 + 1.4 and math.abs(lp.Z) < laser.Size.Z / 2 + 1.4 then
+			if math.abs(lp.X) < laser.Size.X/2+1.4 and math.abs(lp.Z) < laser.Size.Z/2+1.4 then
 				isSafe = false
-				print(string.format("[LAND-UNSAFE] '%s' will be at landing zone", laser.Name))
 			end
 		end
 	end
 
-	local col
-	if not isSafe then
-		col = Color3.fromRGB(255, 50, 50)
-	elseif minGap < TIGHT_CLEARANCE then
-		col = Color3.fromRGB(255, 160, 30)
-	else
-		col = Color3.fromRGB(60, 220, 100)
-	end
-	for i = 1, steps do vizParts[i].Color = col end
+	local col = isSafe
+		and (minGap < TIGHT_CLEARANCE and Color3.fromRGB(255,160,30) or Color3.fromRGB(60,220,100))
+		or  Color3.fromRGB(255,50,50)
+	for i = 1, VIZ_STEPS do vizParts[i].Color = col end
 
 	return isSafe, minGap
 end
@@ -331,18 +303,12 @@ local function clampToSafeZone(pos)
 	return pos
 end
 
-local function timeToImpact(localZ, laserSpeed)
-	if laserSpeed < 0.1 then return localZ end
-	return localZ / laserSpeed
-end
-
 -- ==========================================
 -- LASER COLLECTION
--- Returns table of threat lasers with metadata
 -- ==========================================
 local function collectThreats(dt, now)
-	local threats     = {}
-	local playerPos   = rootPart.Position
+	local threats   = {}
+	local playerPos = rootPart.Position
 	local shouldPrint = (now - lastDebugPrint) >= DEBUG_INTERVAL
 
 	for _, item in ipairs(lasersFolder:GetChildren()) do
@@ -361,31 +327,25 @@ local function collectThreats(dt, now)
 		local tipVel = getLaserTipVelocity(item, oldCF, dt)
 		local speed  = tipVel.Magnitude
 
-		-- RESET
 		if worldDist > RESET_WORLD_DIST then
 			laserPassedFlag[item] = false
 			lastLaserSide[item]   = nil
 			continue
 		end
 
-		-- PASSED DETECTION
 		if not laserPassedFlag[item] then
 			if speed > LASER_MOVE_THRESHOLD then
-				local toPlayer = Vector3.new(
-					playerPos.X - item.Position.X, 0,
-					playerPos.Z - item.Position.Z)
-				local flatVel = Vector3.new(tipVel.X, 0, tipVel.Z)
+				local toPlayer = Vector3.new(playerPos.X-item.Position.X, 0, playerPos.Z-item.Position.Z)
+				local flatVel  = Vector3.new(tipVel.X, 0, tipVel.Z)
 				local dot = toPlayer.Magnitude > 0.01 and flatVel:Dot(toPlayer.Unit) or 0
-
 				if dot < -0.3 and localZ < PASS_CONFIRM_DIST then
 					laserPassedFlag[item] = true
 					print(string.format("[PASSED-VEL] '%s' dot=%.2f", item.Name, dot))
 				end
-
 				local prevSide = lastLaserSide[item]
 				if prevSide and prevSide ~= currentSide then
 					laserPassedFlag[item] = true
-					print(string.format("[PASSED-FLIP] '%s' %d->%d", item.Name, prevSide, currentSide))
+					print(string.format("[PASSED-FLIP] '%s'", item.Name))
 				end
 			end
 		end
@@ -394,19 +354,19 @@ local function collectThreats(dt, now)
 		if laserPassedFlag[item] then continue end
 		if localZ > AGGRO_DISTANCE then continue end
 
-		local tti = timeToImpact(localZ, speed)
+		local tti = speed > 0.1 and (localZ / speed) or localZ
 
 		if shouldPrint then
 			print(string.format("[DBG] '%s' localZ=%.1f TTI=%.2f spd=%.1f", item.Name, localZ, tti, speed))
 		end
 
 		table.insert(threats, {
-			laser     = item,
-			localZ    = localZ,
-			tti       = tti,
-			velocity  = tipVel,
-			objPos    = objPos,
-			side      = currentSide,
+			laser    = item,
+			localZ   = localZ,
+			tti      = tti,
+			velocity = tipVel,
+			objPos   = objPos,
+			side     = currentSide,
 			worldDist = worldDist,
 		})
 	end
@@ -417,41 +377,25 @@ end
 
 -- ==========================================
 -- CROSSING DETECTION
--- Given threat list, find the best crossing pair.
--- Returns: crossPoint (Vector3), laserA, laserB  OR  nil
 -- ==========================================
 local function findCrossing(threats)
-	local playerPos  = rootPart.Position
-	local bestDist   = MAX_CROSS_DIST
-	local bestPoint  = nil
-	local bestA, bestB = nil, nil
+	local playerPos = rootPart.Position
+	local bestDist  = MAX_CROSS_DIST
+	local bestPoint, bestA, bestB = nil, nil, nil
 
 	for i = 1, #threats do
-		for j = i + 1, #threats do
-			local a = threats[i]
-			local b = threats[j]
-
-			-- Both must be reasonably close
+		for j = i+1, #threats do
+			local a = threats[i];  local b = threats[j]
 			if a.worldDist > CROSS_BOTH_DIST or b.worldDist > CROSS_BOTH_DIST then continue end
-
 			local pt, t = findLaserIntersection(a.laser, b.laser)
 			if not pt then continue end
-
-			-- Intersection must be ahead of the player (not behind both lasers)
-			local distToPlayer = (Vector3.new(pt.X, playerPos.Y, pt.Z) - playerPos).Magnitude
-			if distToPlayer > bestDist then continue end
-
-			-- The intersection parameter t should be reasonable (not way behind laser)
-			-- t < 0 means the crossing is behind laser A's origin along its axis
 			if t ~= nil and t < -5 then continue end
-
-			bestDist  = distToPlayer
-			bestPoint = pt
-			bestA     = a
-			bestB     = b
+			local d = (Vector3.new(pt.X, playerPos.Y, pt.Z) - playerPos).Magnitude
+			if d < bestDist then
+				bestDist = d;  bestPoint = pt;  bestA = a;  bestB = b
+			end
 		end
 	end
-
 	return bestPoint, bestA, bestB
 end
 
@@ -469,7 +413,7 @@ RunService.Heartbeat:Connect(function(dt)
 
 	if not checkOnArena() then
 		hideVisualizer()
-		setStatus("\xe2\x97\x89 Off arena \xe2\x80\x93 idle", Color3.fromRGB(180,180,180))
+		setStatus("\xe2\x97\x89 Off arena", Color3.fromRGB(180,180,180))
 		timerLabel.Text = string.format("\xe2\x8f\xb1  %.1fs", now - runStart)
 		lastRootPos = nil
 		return
@@ -478,14 +422,13 @@ RunService.Heartbeat:Connect(function(dt)
 	timerLabel.Text = string.format("\xe2\x8f\xb1  %.1fs", now - runStart)
 	jumpLabel.Text  = string.format("\xf0\x9f\xa6\x98 Jumps: %d", jumpCount)
 
-	-- Position-delta movement direction (reliable with MoveTo)
+	-- Position-delta move dir
 	local realMoveDir = Vector3.zero
 	if lastRootPos then
-		local delta = rootPart.Position - lastRootPos
-		local flat  = Vector3.new(delta.X, 0, delta.Z)
-		if flat.Magnitude > 0.005 then
-			realMoveDir = flat.Unit
-		end
+		local flat = Vector3.new(
+			rootPart.Position.X - lastRootPos.X, 0,
+			rootPart.Position.Z - lastRootPos.Z)
+		if flat.Magnitude > 0.005 then realMoveDir = flat.Unit end
 	end
 	lastRootPos = rootPart.Position
 
@@ -497,104 +440,92 @@ RunService.Heartbeat:Connect(function(dt)
 
 	if #threats == 0 then
 		hideVisualizer()
-		crossLabel.Text      = "\xe2\x9c\x96 No crossing"
+		crossLabel.Text       = "\xe2\x9c\x96 No crossing"
 		crossLabel.TextColor3 = Color3.fromRGB(120,200,255)
-		setStatus("\xe2\x97\x89 Safe \xe2\x80\x93 holding centre", Color3.fromRGB(80, 220, 160))
+		setStatus("\xe2\x97\x89 Safe \xe2\x80\x93 holding centre", Color3.fromRGB(80,220,160))
 		if not isInAir then humanoid:MoveTo(mapCenter) end
 		return
 	end
 
-	-- ---- CROSSING CHECK ----
 	local crossPoint, crossA, crossB = findCrossing(threats)
 	local isCrossing = crossPoint ~= nil
 
 	if isCrossing then
-		crossLabel.Text       = string.format("\xe2\x9c\x96 CROSS: %s + %s", crossA.laser.Name, crossB.laser.Name)
-		crossLabel.TextColor3 = Color3.fromRGB(0, 220, 255)
+		crossLabel.Text       = string.format("\xe2\x9c\x96 CROSS: %s+%s", crossA.laser.Name, crossB.laser.Name)
+		crossLabel.TextColor3 = Color3.fromRGB(0,220,255)
 		crossMarker.Position     = crossPoint
 		crossMarker.Transparency = 0
-		print(string.format("[CROSS] %s + %s at (%.1f, %.1f)", crossA.laser.Name, crossB.laser.Name, crossPoint.X, crossPoint.Z))
 	else
 		crossLabel.Text       = "\xe2\x9c\x96 No crossing"
-		crossLabel.TextColor3 = Color3.fromRGB(120, 200, 255)
+		crossLabel.TextColor3 = Color3.fromRGB(120,200,255)
 		crossMarker.Transparency = 1
 	end
 
-	-- Pick the primary threat (lowest TTI)
 	table.sort(threats, function(a, b) return a.tti < b.tti end)
 	local primary = threats[1]
 
 	if isInAir then
-		-- In air: just keep heading toward target
+		-- Keep heading to target while in air
 		local farSide = primary.laser.CFrame * Vector3.new(primary.objPos.X, 0, -primary.side * 15)
 		humanoid:MoveTo(clampToSafeZone(farSide))
 		hideVisualizer()
 		return
 	end
 
-	setStatus("\xe2\x97\x89 Reacting to laser", Color3.fromRGB(255, 160, 40))
+	-- Decide jump target
+	local jumpTarget
+	local checkLasers     = {}
+	local checkVelocities = {}
 
-	if canJump and primary.localZ <= JUMP_TRIGGER_DISTANCE + 5 then
+	if isCrossing then
+		local playerPos   = rootPart.Position
+		local towardCross = Vector3.new(crossPoint.X-playerPos.X, 0, crossPoint.Z-playerPos.Z)
+		if towardCross.Magnitude > 0.01 then towardCross = towardCross.Unit end
+		jumpTarget = Vector3.new(
+			crossPoint.X + towardCross.X * CROSS_OVERSHOOT,
+			crossPoint.Y,
+			crossPoint.Z + towardCross.Z * CROSS_OVERSHOOT
+		)
+		table.insert(checkLasers,     crossA.laser);     table.insert(checkVelocities, crossA.velocity)
+		table.insert(checkLasers,     crossB.laser);     table.insert(checkVelocities, crossB.velocity)
+	else
+		jumpTarget = primary.laser.CFrame * Vector3.new(primary.objPos.X, 0, -primary.side * 15)
+		table.insert(checkLasers,     primary.laser);    table.insert(checkVelocities, primary.velocity)
+	end
 
-		-- Determine jump target
-		local jumpTarget
-		local checkLasers   = {}
-		local checkVelocities = {}
+	local toTarget     = jumpTarget - rootPart.Position
+	local flatToTarget = Vector3.new(toTarget.X, 0, toTarget.Z)
+	local predictDir   = flatToTarget.Magnitude > 0.01 and flatToTarget.Unit or realMoveDir
 
-		if isCrossing then
-			-- Aim past the crossing point
-			local playerPos = rootPart.Position
-			local towardCross = Vector3.new(crossPoint.X - playerPos.X, 0, crossPoint.Z - playerPos.Z)
-			if towardCross.Magnitude > 0.01 then
-				towardCross = towardCross.Unit
-			end
-			-- Target = crossPoint + a bit further in same direction
-			jumpTarget = Vector3.new(
-				crossPoint.X + towardCross.X * CROSS_OVERSHOOT,
-				crossPoint.Y,
-				crossPoint.Z + towardCross.Z * CROSS_OVERSHOOT
-			)
-			-- Check BOTH crossing lasers
-			table.insert(checkLasers,    crossA.laser)
-			table.insert(checkVelocities, crossA.velocity)
-			table.insert(checkLasers,    crossB.laser)
-			table.insert(checkVelocities, crossB.velocity)
-			setStatus("\xe2\x97\x89 CROSSING JUMP!", Color3.fromRGB(0, 220, 255))
-		else
-			-- Normal single-laser target: far side
-			jumpTarget = primary.laser.CFrame * Vector3.new(primary.objPos.X, 0, -primary.side * 15)
-			table.insert(checkLasers,    primary.laser)
-			table.insert(checkVelocities, primary.velocity)
-		end
-
-		local toTarget     = jumpTarget - rootPart.Position
-		local flatToTarget = Vector3.new(toTarget.X, 0, toTarget.Z)
-		local predictDir   = flatToTarget.Magnitude > 0.01
-			and flatToTarget.Unit or realMoveDir
-
+	if canJump and primary.localZ <= JUMP_TRIGGER_DISTANCE then
+		-- LASER IS HERE - run arc check and jump immediately if safe
 		local safe, gap = predictTrajectoryMulti(checkLasers, checkVelocities, predictDir)
-
-		if primary.localZ <= JUMP_TRIGGER_DISTANCE and safe then
-			print(string.format("[JUMP%s] primary='%s' dist=%.1f gap=%.2f",
-				isCrossing and "(CROSS)" or "", primary.laser.Name, primary.localZ, gap or 0))
+		if safe then
+			print(string.format("[JUMP%s] '%s' localZ=%.2f gap=%.2f",
+				isCrossing and "(X)" or "", primary.laser.Name, primary.localZ, gap or 0))
 			lastJumpTime = now
 			jumpCount    = jumpCount + 1
 			jumpLabel.Text = string.format("\xf0\x9f\xa6\x98 Jumps: %d", jumpCount)
 			humanoid:MoveTo(clampToSafeZone(jumpTarget))
 			humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-
-		elseif not safe then
-			-- Back away from primary laser
-			local backupTarget = primary.laser.CFrame * Vector3.new(primary.objPos.X, 0, primary.side * BACKUP_DIST)
-			humanoid:MoveTo(clampToSafeZone(backupTarget))
-			setStatus("\xe2\x97\x89 Backing up (unsafe arc)", Color3.fromRGB(255, 80, 80))
+			setStatus(isCrossing and "\xe2\x97\x89 CROSSING JUMP!" or "\xe2\x97\x89 Jumping!",
+				Color3.fromRGB(60,220,100))
 		else
-			-- Approach
-			humanoid:MoveTo(clampToSafeZone(jumpTarget))
+			-- Arc not safe yet - STAND STILL and wait for laser to be jumpable
+			-- Do NOT call MoveTo (no movement = stay in place)
+			setStatus("\xe2\x97\x89 Waiting for safe arc\xe2\x80\xa6", Color3.fromRGB(255,120,40))
 		end
+
+	elseif primary.localZ <= APPROACH_START then
+		-- Laser is nearby but not trigger distance yet - walk toward it
+		humanoid:MoveTo(clampToSafeZone(jumpTarget))
+		setStatus("\xe2\x97\x89 Approaching laser", Color3.fromRGB(255,180,40))
+		-- Run prediction so arc colour updates live
+		predictTrajectoryMulti(checkLasers, checkVelocities, predictDir)
 	else
-		-- Walk toward primary laser far side (approach)
-		local farSide = primary.laser.CFrame * Vector3.new(primary.objPos.X, 0, -primary.side * 15)
-		humanoid:MoveTo(clampToSafeZone(farSide))
+		-- Far away - hold centre
+		humanoid:MoveTo(mapCenter)
+		hideVisualizer()
+		setStatus("\xe2\x97\x89 Holding centre", Color3.fromRGB(140,180,255))
 	end
 end)
