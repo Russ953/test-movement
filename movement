@@ -1,7 +1,7 @@
 -- ==========================================
--- MOVEMENT SCRIPT v6
+-- MOVEMENT SCRIPT v8
 -- ==========================================
-print("[Movement] v6 loaded")
+print("[Movement] v8 loaded")
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -22,8 +22,13 @@ local JUMP_TRIGGER_DISTANCE = 5.5
 local AGGRO_DISTANCE = 15
 local CLEARANCE_DISTANCE = 6
 local JUMP_COOLDOWN = 0.1
+-- Only reset the passed flag once the laser is this far away
+-- Must be bigger than AGGRO_DISTANCE so the flag never resets while still nearby
+local RESET_DISTANCE = AGGRO_DISTANCE + 2
 
-local lastLaserCFrames = setmetatable({}, {__mode = "k"})
+local lastLaserCFrames  = setmetatable({}, {__mode = "k"})
+local lastLaserSide     = setmetatable({}, {__mode = "k"})
+local laserPassedFlag   = setmetatable({}, {__mode = "k"})
 local lastJumpTime = 0
 
 local lastDebugPrint = 0
@@ -148,71 +153,52 @@ local function getClosestLaser(dt, now)
 			lastLaserCFrames[item] = item.CFrame
 
 			local currentVel = Vector3.zero
-			local isMovingAway = false
-			local sweepDot = 0
-			local transDot = 0
-
 			if oldCF then
-				-- World-space translation velocity
-				local posDelta = item.Position - oldCF.Position
-				currentVel = posDelta / dt
+				currentVel = (item.Position - oldCF.Position) / dt
+			end
 
-				local toPlayer = Vector3.new(
-					playerPos.X - item.Position.X,
-					0,
-					playerPos.Z - item.Position.Z
-				)
+			-- STEP 1: Reset the flag ONLY once the laser is truly far away.
+			-- RESET_DISTANCE > AGGRO_DISTANCE ensures we never reset while still in range.
+			if distToLine > RESET_DISTANCE then
+				if laserPassedFlag[item] then
+					print(string.format("[RESET] '%s' dist=%.2f - flag cleared", item.Name, distToLine))
+				end
+				laserPassedFlag[item] = false
+				lastLaserSide[item] = nil
+				continue -- no need to process further if this far away
+			end
 
-				if toPlayer.Magnitude > 0.01 then
-					local toPlayerUnit = toPlayer.Unit
+			local prevSide = lastLaserSide[item]
+			lastLaserSide[item] = currentSide
 
-					-- CHECK 1: Translation (for lasers that slide)
-					local flatVel = Vector3.new(currentVel.X, 0, currentVel.Z)
-					transDot = flatVel:Dot(toPlayerUnit)
-
-					-- CHECK 2: Rotation / sweep (for pivot lasers whose position never changes)
-					-- The laser's local Z axis points along its length.
-					-- We compare where that Z axis pointed last frame vs this frame
-					-- relative to the player direction to see which way it is sweeping.
-					local oldFwd = Vector3.new(oldCF.LookVector.X, 0, oldCF.LookVector.Z)
-					local newFwd = Vector3.new(item.CFrame.LookVector.X, 0, item.CFrame.LookVector.Z)
-
-					if oldFwd.Magnitude > 0.01 and newFwd.Magnitude > 0.01 then
-						-- Angular velocity direction via cross product (Y component = rotation around Y axis)
-						local cross = oldFwd:Cross(newFwd)
-						-- If cross.Y > 0 the laser rotated counter-clockwise, < 0 clockwise
-						-- The tip of the laser moves in the direction perpendicular to LookVector
-						-- We need to know if that sweep is carrying the beam AWAY from the player
-						-- Tip velocity direction = cross(up, lookVector) * sign(cross.Y)
-						local up = Vector3.new(0, 1, 0)
-						local sweepDir = up:Cross(newFwd) * math.sign(cross.Y + 1e-9)
-						if sweepDir.Magnitude > 0.01 then
-							sweepDot = sweepDir.Unit:Dot(toPlayerUnit)
-						end
-					end
-
-					-- Moving away if EITHER translation is going away OR sweep is going away
-					-- Use a small threshold to filter noise
-					local isTransAway = transDot < -0.05
-					local isSweepAway = sweepDot < -0.1
-					isMovingAway = isTransAway or isSweepAway
+			-- STEP 2: Only set the passed flag, NEVER clear it from side flips.
+			-- Once passed=true, subsequent side flips (laser sweeping back) are ignored.
+			-- The ONLY way to clear it is RESET_DISTANCE above.
+			if not laserPassedFlag[item] then
+				if prevSide and prevSide ~= currentSide then
+					laserPassedFlag[item] = true
+					print(string.format("[SIDEFLIP] '%s' %d->%d dist=%.2f - marked passed",
+						item.Name, prevSide, currentSide, distToLine))
 				end
 			end
 
+			local isPassed = laserPassedFlag[item] == true
+
 			if shouldPrint and distToLine <= AGGRO_DISTANCE then
 				print(string.format(
-					"[DBG] '%s' dist=%.2f side=%d transDot=%.3f sweepDot=%.3f away=%s canJump=%s",
+					"[DBG] '%s' dist=%.2f side=%d passed=%s canJump=%s",
 					item.Name, distToLine, currentSide,
-					transDot, sweepDot,
-					tostring(isMovingAway), tostring(not isMovingAway)
+					tostring(isPassed), tostring(not isPassed)
 				))
 			end
 
 			local isEscaping = false
-			if isMovingAway then
+			if isPassed then
 				if distToLine < CLEARANCE_DISTANCE then
+					-- Too close behind, walk away
 					isEscaping = true
 				else
+					-- Far enough behind, ignore this laser entirely
 					continue
 				end
 			end
@@ -221,11 +207,10 @@ local function getClosestLaser(dt, now)
 				minDistance = distToLine
 				closestLaser = item
 				laserVelocity = currentVel
-				canJumpClosest = not isMovingAway
+				canJumpClosest = not isPassed
 
 				local targetSide = isEscaping and currentSide or -currentSide
-				local walkThroughZ = targetSide * 15
-				closestTargetPos = item.CFrame * Vector3.new(objPos.X, 0, walkThroughZ)
+				closestTargetPos = item.CFrame * Vector3.new(objPos.X, 0, targetSide * 15)
 			end
 		end
 	end
@@ -261,10 +246,7 @@ RunService.Heartbeat:Connect(function(dt)
 				local jumpIsSafe = predictJumpSafety(laser, laserVelocity)
 
 				if dist <= JUMP_TRIGGER_DISTANCE and jumpIsSafe then
-					print(string.format(
-						"[JUMP] Firing! laser='%s' dist=%.2f canJump=%s safe=%s",
-						laser.Name, dist, tostring(canJump), tostring(jumpIsSafe)
-					))
+					print(string.format("[JUMP] Firing! laser='%s' dist=%.2f", laser.Name, dist))
 					lastJumpTime = now
 					humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
 				end
