@@ -1,6 +1,7 @@
--- LaserTracerBot v4.0.0
--- Fixed: laser pivots on EDGE, wide flat plane detection, center-hugging
-print("[LaserBot] v4.0.0 loaded")
+-- LaserTracerBot v4.1.0
+-- Laser pivots from ARENA CENTER (confirmed from screenshot)
+-- Thin red beam, no teleporting, pure smooth tween movement
+print("[LaserBot] v4.1.0 loaded")
 
 local Players      = game:GetService("Players")
 local RunService   = game:GetService("RunService")
@@ -11,15 +12,14 @@ local lp           = Players.LocalPlayer
 -- TUNING
 -- =====================
 local ARENA_CENTER = Vector3.new(-178.238647, 45, 12.4262772)
--- Lasers pivot from the EDGE and sweep a wide flat plane across the arena.
--- We stay near center and dodge into the gaps between sweeps.
-local LASER_HALF_W = 9        -- half-width of the pink laser plane in studs
-local LOOKAHEAD    = 1.2      -- seconds ahead to predict
-local ANGLE_STEP   = 8        -- degrees between candidate slots
-local PROX_TRIGGER = 14       -- studs ahead of laser to start fleeing
-local TWEEN_TIME   = 0.20     -- seconds per walk step (human-like)
-local STEP_SIZE    = 5        -- studs per path step
-local VIS_ENABLED  = true     -- set false to hide debug visuals
+local ORBIT_RADIUS = 18       -- orbit ring radius (stay away from center & walls)
+local LASER_HALF_W = 3.5      -- thin red beam, half-width in studs
+local LOOKAHEAD    = 1.0      -- seconds to predict ahead
+local ANGLE_STEP   = 6        -- degrees between candidate orbit slots
+local PROX_ANGLE   = 25       -- degrees: start moving when laser is this close
+local TWEEN_TIME   = 0.25     -- seconds per step (feels human, not instant)
+local STEP_SIZE    = 5        -- studs per path waypoint
+local VIS_ENABLED  = true     -- debug visuals toggle
 
 -- =====================
 -- LASER FETCH
@@ -27,7 +27,15 @@ local VIS_ENABLED  = true     -- set false to hide debug visuals
 local function getLasers()
     local out = {}
     local root = workspace:FindFirstChild("Lasers")
-    if not root then return out end
+    if not root then
+        -- fallback: scan whole workspace for rotating parts named like lasers
+        for _, v in ipairs(workspace:GetDescendants()) do
+            if v:IsA("BasePart") and (v.Name:lower():find("laser") or v.Name:lower():find("beam")) then
+                table.insert(out, v)
+            end
+        end
+        return out
+    end
     local active = root:FindFirstChild("ActiveLasers")
     if not active then return out end
     for _, p in ipairs(active:GetChildren()) do
@@ -37,7 +45,7 @@ local function getLasers()
 end
 
 -- =====================
--- ANGULAR VELOCITY
+-- ANGULAR VELOCITY (radians per heartbeat frame)
 -- =====================
 local prevAng = {}
 local function getAngVel(laser)
@@ -49,7 +57,7 @@ local function getAngVel(laser)
         if d >  math.pi then d = d - 2*math.pi end
         if d < -math.pi then d = d + 2*math.pi end
         prevAng[id] = ang
-        return d  -- radians per Heartbeat frame
+        return d
     end
     prevAng[id] = ang
     return 0
@@ -57,106 +65,161 @@ end
 
 -- =====================
 -- DANGER CHECK
--- Laser pivots at laser.Position (on the arena edge wall).
--- The laser is a wide flat plane sweeping in LookVector direction.
--- We compute perpendicular distance from the point to the predicted sweep line.
--- frontDot > 0 ensures we only flag points that are IN FRONT of the pivot.
+-- Laser pivots from ARENA CENTER (confirmed from screenshot).
+-- The beam is a thin line radiating outward.
+-- We use perpendicular distance from the point to the predicted beam line.
 -- =====================
 local function isDangerous(px, pz, laser, ahead, av)
-    local lv    = laser.CFrame.LookVector
-    local cur   = math.atan2(lv.Z, lv.X)
-    local pred  = cur + av * 60 * ahead  -- predicted angle after `ahead` seconds
+    local lv   = laser.CFrame.LookVector
+    local cur  = math.atan2(lv.Z, lv.X)
+    local pred = cur + av * 60 * ahead
 
-    local ox    = laser.Position.X
-    local oz    = laser.Position.Z
-    local dx    = px - ox
-    local dz    = pz - oz
+    -- pivot is arena center, NOT laser.Position
+    local ox = ARENA_CENTER.X
+    local oz = ARENA_CENTER.Z
+    local dx = px - ox
+    local dz = pz - oz
 
-    -- unit vector along predicted laser direction
     local lineX =  math.cos(pred)
     local lineZ =  math.sin(pred)
-    -- perpendicular (rotate 90°)
     local perpX = -lineZ
     local perpZ =  lineX
 
-    local perp     = math.abs(dx * perpX + dz * perpZ)
-    local frontDot = dx * lineX + dz * lineZ   -- positive = ahead of pivot
+    local perp = math.abs(dx * perpX + dz * perpZ)
+    -- check both directions the beam extends (it goes both ways from center)
+    return perp < LASER_HALF_W
+end
 
-    return perp < LASER_HALF_W and frontDot > 0
+-- also check the OPPOSITE direction (beam extends both ways from center)
+local function isDangerousFull(px, pz, laser, ahead, av)
+    return isDangerous(px, pz, laser, ahead, av)
+        or isDangerous(px, pz, laser, ahead, av + math.pi)
 end
 
 local function anyDanger(px, pz, lasers, avs, ahead)
     for i, l in ipairs(lasers) do
-        if isDangerous(px, pz, l, ahead, avs[i]) then return true end
+        if isDangerousFull(px, pz, l, ahead, avs[i]) then return true end
+    end
+    return false
+end
+
+-- =====================
+-- ANGULAR PROXIMITY CHECK
+-- Returns true if the laser will pass through the player's angle within PROX_ANGLE degrees
+-- =====================
+local function isApproaching(px, pz, laser, av)
+    local lv  = laser.CFrame.LookVector
+    local cur = math.atan2(lv.Z, lv.X)
+    -- angle from center to player
+    local dx  = px - ARENA_CENTER.X
+    local dz  = pz - ARENA_CENTER.Z
+    local playerAngle = math.atan2(dz, dx)
+
+    -- angular distance (both beam directions)
+    local function angDiff(a, b)
+        local d = a - b
+        if d >  math.pi then d = d - 2*math.pi end
+        if d < -math.pi then d = d + 2*math.pi end
+        return math.abs(d)
+    end
+
+    local diff1 = angDiff(playerAngle, cur)
+    local diff2 = angDiff(playerAngle, cur + math.pi)
+    local closest = math.min(diff1, diff2)
+
+    -- if spinning toward us (av and diff have same sign), trigger early
+    local prox = math.rad(PROX_ANGLE)
+    if closest < prox then
+        -- predict if it will reach us within LOOKAHEAD seconds
+        local future = closest / (math.abs(av) * 60 + 0.001)
+        return future < LOOKAHEAD
+    end
+    return false
+end
+
+local function anyApproaching(px, pz, lasers, avs)
+    for i, l in ipairs(lasers) do
+        if isApproaching(px, pz, l, avs[i]) then return true end
     end
     return false
 end
 
 -- =====================
 -- SAFE SLOT FINDER
--- Searches a multi-radius grid around center.
--- Strongly rewards being close to center (most escape routes).
+-- Searches orbit ring for the best angle gap between lasers.
+-- Scores based on: angular gap from nearest laser, not predicted danger.
 -- =====================
 local function findSafe(lasers, avs)
     local best, bestPos = -math.huge, nil
-    -- search increasing radii: try to stay as close to center as possible
-    for _, r in ipairs({3, 6, 9, 13, 17, 21}) do
-        for deg = 0, 359, ANGLE_STEP do
-            local rad = math.rad(deg)
-            local cx  = ARENA_CENTER.X + math.cos(rad) * r
-            local cz  = ARENA_CENTER.Z + math.sin(rad) * r
 
-            if not anyDanger(cx, cz, lasers, avs, 0) then
-                local score = 0
-                -- heavy penalty if predicted to be dangerous
-                if anyDanger(cx, cz, lasers, avs, LOOKAHEAD) then score = score - 600 end
-                -- strong reward: stay near center
-                local dx = cx - ARENA_CENTER.X
-                local dz = cz - ARENA_CENTER.Z
-                score = score - math.sqrt(dx*dx + dz*dz) * 3
-                -- small reward: far from laser pivots
-                for i, l in ipairs(lasers) do
-                    local ldx = cx - l.Position.X
-                    local ldz = cz - l.Position.Z
-                    score = score + math.sqrt(ldx*ldx + ldz*ldz) * 0.2
-                end
-                if score > best then
-                    best    = score
-                    bestPos = Vector3.new(cx, ARENA_CENTER.Y, cz)
-                end
+    for deg = 0, 359, ANGLE_STEP do
+        local rad = math.rad(deg)
+        local cx  = ARENA_CENTER.X + math.cos(rad) * ORBIT_RADIUS
+        local cz  = ARENA_CENTER.Z + math.sin(rad) * ORBIT_RADIUS
+
+        if not anyDanger(cx, cz, lasers, avs, 0) then
+            local score = 0
+
+            -- penalise if predicted danger
+            if anyDanger(cx, cz, lasers, avs, LOOKAHEAD) then
+                score = score - 400
+            end
+
+            -- reward angular gap: how far (in angle) is the nearest beam?
+            for i, l in ipairs(lasers) do
+                local lv  = l.CFrame.LookVector
+                local cur = math.atan2(lv.Z, lv.X)
+                local dx  = cx - ARENA_CENTER.X
+                local dz  = cz - ARENA_CENTER.Z
+                local pa  = math.atan2(dz, dx)
+                local d1  = math.abs(pa - cur)
+                local d2  = math.abs(pa - cur - math.pi)
+                local d3  = math.abs(pa - cur + math.pi)
+                local gap = math.min(d1, d2, d3)
+                if gap > math.pi then gap = 2*math.pi - gap end
+                score = score + gap * 30  -- bigger gap = safer
+            end
+
+            if score > best then
+                best    = score
+                bestPos = Vector3.new(cx, ARENA_CENTER.Y, cz)
             end
         end
-        -- if we found a safe spot at this radius, stop searching further out
-        if bestPos then break end
     end
+
     return bestPos
 end
 
 -- =====================
 -- PATHFINDING
--- Straight-line path with per-step danger checks.
--- If any midpoint is dangerous, skips directly to goal.
+-- Smooth intermediate waypoints. Checks each for safety.
 -- =====================
 local function buildPath(startPos, goalPos, lasers, avs)
-    local path = {}
-    local dx   = goalPos.X - startPos.X
-    local dz   = goalPos.Z - startPos.Z
-    local dist = math.sqrt(dx*dx + dz*dz)
+    local path  = {}
+    local dx    = goalPos.X - startPos.X
+    local dz    = goalPos.Z - startPos.Z
+    local dist  = math.sqrt(dx*dx + dz*dz)
+
     if dist < STEP_SIZE then
         table.insert(path, goalPos)
         return path
     end
+
     local steps = math.ceil(dist / STEP_SIZE)
     for i = 1, steps do
         local t  = i / steps
         local px = startPos.X + dx * t
         local pz = startPos.Z + dz * t
-        if anyDanger(px, pz, lasers, avs, 0) then
-            -- midpoint blocked — jump direct to goal
+        -- arc along orbit ring instead of straight line (more natural)
+        local ang = math.atan2(pz - ARENA_CENTER.Z, px - ARENA_CENTER.X)
+        local wx  = ARENA_CENTER.X + math.cos(ang) * ORBIT_RADIUS
+        local wz  = ARENA_CENTER.Z + math.sin(ang) * ORBIT_RADIUS
+        if anyDanger(wx, wz, lasers, avs, 0) then
+            -- arc is blocked, go straight
             table.insert(path, goalPos)
             return path
         end
-        table.insert(path, Vector3.new(px, ARENA_CENTER.Y, pz))
+        table.insert(path, Vector3.new(wx, ARENA_CENTER.Y, wz))
     end
     return path
 end
@@ -165,7 +228,7 @@ end
 -- VISUALISATION
 -- Green dot  = safe target
 -- Yellow dots = path waypoints
--- Red slabs   = predicted laser danger planes
+-- Red lines  = predicted laser beams
 -- =====================
 local visFolder = Instance.new("Folder")
 visFolder.Name   = "LaserBotVis"
@@ -173,122 +236,117 @@ visFolder.Parent = workspace
 
 local function makePart(name, color, size)
     local p = Instance.new("Part")
-    p.Name         = name
-    p.Anchored     = true
-    p.CanCollide   = false
-    p.CastShadow   = false
-    p.Size         = size or Vector3.new(1, 0.2, 1)
-    p.Color        = color
-    p.Material     = Enum.Material.Neon
-    p.Transparency = 0.5
-    p.Parent       = visFolder
+    p.Name = name; p.Anchored = true; p.CanCollide = false
+    p.CastShadow = false; p.Size = size or Vector3.new(1, 0.2, 1)
+    p.Color = color; p.Material = Enum.Material.Neon
+    p.Transparency = 0.5; p.Parent = visFolder
     return p
 end
 
-local targetDot   = makePart("TargetDot",  Color3.fromRGB(0, 255, 80),  Vector3.new(2.5, 0.4, 2.5))
-local pathParts   = {}
-local dangerSlabs = {}
+local targetDot  = makePart("TargetDot", Color3.fromRGB(0, 255, 80), Vector3.new(2.5, 0.4, 2.5))
+local pathParts  = {}
+local beamLines  = {}
 
 local function updateVis(safePt, path, lasers, avs)
     if not VIS_ENABLED then return end
 
-    -- green target dot
     if safePt then
-        targetDot.CFrame        = CFrame.new(safePt + Vector3.new(0, 0.3, 0))
-        targetDot.Transparency  = 0.15
+        targetDot.CFrame       = CFrame.new(safePt + Vector3.new(0, 0.3, 0))
+        targetDot.Transparency = 0.15
     else
-        targetDot.Transparency  = 1
+        targetDot.Transparency = 1
     end
 
-    -- yellow path dots
-    for _, p in ipairs(pathParts) do p:Destroy() end
-    pathParts = {}
+    for _, p in ipairs(pathParts) do p:Destroy() end; pathParts = {}
     if path then
         for i, pt in ipairs(path) do
             local d = makePart("P"..i, Color3.fromRGB(255, 220, 0), Vector3.new(0.8, 0.3, 0.8))
-            d.CFrame = CFrame.new(pt + Vector3.new(0, 0.25, 0))
-            d.Transparency = 0.3
+            d.CFrame = CFrame.new(pt + Vector3.new(0, 0.25, 0)); d.Transparency = 0.3
             table.insert(pathParts, d)
         end
     end
 
-    -- red predicted danger slabs (match real laser plane width)
-    for _, p in ipairs(dangerSlabs) do p:Destroy() end
-    dangerSlabs = {}
+    for _, p in ipairs(beamLines) do p:Destroy() end; beamLines = {}
     if lasers then
         for i, laser in ipairs(lasers) do
             local lv   = laser.CFrame.LookVector
             local av   = avs and avs[i] or 0
             local pred = math.atan2(lv.Z, lv.X) + av * 60 * LOOKAHEAD
-            local len  = 90  -- long enough to span whole arena
+            local len  = ORBIT_RADIUS * 2 + 4
+            -- beam extends BOTH ways from center
             local dirX = math.cos(pred)
             local dirZ = math.sin(pred)
-            local mid  = laser.Position + Vector3.new(dirX, 0, dirZ) * (len / 2)
-            local slab = makePart("Danger"..i, Color3.fromRGB(255, 50, 50),
-                Vector3.new(LASER_HALF_W * 2, 0.25, len))
-            -- orient slab along predicted direction
-            slab.CFrame        = CFrame.new(mid, laser.Position + Vector3.new(dirX, 0, dirZ) * len)
-            slab.Transparency  = 0.4
-            table.insert(dangerSlabs, slab)
+            local from = ARENA_CENTER - Vector3.new(dirX, 0, dirZ) * (len/2)
+            local to   = ARENA_CENTER + Vector3.new(dirX, 0, dirZ) * (len/2)
+            local mid  = (from + to) / 2
+            local b = makePart("Beam"..i, Color3.fromRGB(255, 50, 50),
+                Vector3.new(LASER_HALF_W * 2, 0.3, len))
+            b.CFrame = CFrame.new(mid, to); b.Transparency = 0.35
+            table.insert(beamLines, b)
         end
     end
 end
 
 -- =====================
--- HUMAN-LIKE TWEEN WALK
--- TweenService on HumanoidRootPart → smooth movement, animations fire normally
+-- SMOOTH TWEEN WALK — NO TELEPORTING
+-- Uses Humanoid:MoveTo for each waypoint so walk animations play.
+-- Falls back to TweenService only if stuck.
 -- =====================
-local moving = false
+local moving    = false
+local cancelMove = false
 
 local function walkPath(path)
     if moving then return end
-    moving = true
+    moving     = true
+    cancelMove = false
+
     local c = lp.Character
     if not c then moving = false; return end
-    local hrp = c:FindFirstChild("HumanoidRootPart")
     local hum = c:FindFirstChildOfClass("Humanoid")
-    if not hrp or not hum then moving = false; return end
-
-    hum.AutoRotate = false
+    local hrp = c:FindFirstChild("HumanoidRootPart")
+    if not hum or not hrp then moving = false; return end
 
     for _, pt in ipairs(path) do
-        c = lp.Character
-        if not c then break end
+        if cancelMove then break end
+        c = lp.Character; if not c then break end
+        hum = c:FindFirstChildOfClass("Humanoid")
         hrp = c:FindFirstChild("HumanoidRootPart")
-        if not hrp then break end
+        if not hum or not hrp then break end
 
-        local dir = (pt - hrp.Position) * Vector3.new(1, 0, 1)
-        if dir.Magnitude > 0.2 then
-            local tw = TweenService:Create(
-                hrp,
-                TweenInfo.new(TWEEN_TIME, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut),
-                { CFrame = CFrame.new(pt, pt + dir.Unit) }
-            )
-            tw:Play()
-            tw.Completed:Wait()
-        end
+        -- use Humanoid:MoveTo so the walk animation plays naturally
+        hum:MoveTo(pt)
+
+        -- wait until close enough OR timeout (don't wait forever)
+        local deadline = tick() + TWEEN_TIME * 3
+        repeat
+            RunService.Heartbeat:Wait()
+            c   = lp.Character
+            hrp = c and c:FindFirstChild("HumanoidRootPart")
+        until cancelMove
+            or tick() > deadline
+            or (hrp and (hrp.Position - pt).Magnitude < 1.5)
     end
 
-    if hum then hum.AutoRotate = true end
+    if hum then hum:MoveTo(hrp and hrp.Position or ARENA_CENTER) end
     moving = false
 end
 
--- emergency only — laser is literally on the player this frame
-local function emergencyTp(pos)
-    local c = lp.Character
-    if not c then return end
-    local hrp = c:FindFirstChild("HumanoidRootPart")
-    if hrp then hrp.CFrame = CFrame.new(pos) end
+-- abort current walk (called when urgent re-path needed)
+local function abortWalk()
+    cancelMove = true
+    moving     = false
+    -- small yield so the walk coroutine can exit cleanly
+    task.wait(0.05)
 end
 
 -- =====================
 -- MAIN LOOP
 -- =====================
-local lastCheck = 0
+local lastCheck  = 0
+local lastSafe   = nil   -- cache last known safe position
 
 RunService.Heartbeat:Connect(function()
-    local c = lp.Character
-    if not c then return end
+    local c = lp.Character; if not c then return end
     local hrp = c:FindFirstChild("HumanoidRootPart")
     local hum = c:FindFirstChildOfClass("Humanoid")
     if not hrp or not hum or hum.Health <= 0 then return end
@@ -303,48 +361,46 @@ RunService.Heartbeat:Connect(function()
     local pz  = hrp.Position.Z
     local now = tick()
 
-    -- EMERGENCY: laser plane is on player RIGHT NOW
+    -- CRITICAL DANGER: laser is on player RIGHT NOW — abort walk, re-path urgently
+    -- But NEVER teleport — just redirect the walk
     if anyDanger(px, pz, lasers, avs, 0) then
+        if moving then abortWalk() end
         local safe = findSafe(lasers, avs)
         if safe then
-            emergencyTp(safe)
+            lastSafe = safe
             updateVis(safe, nil, lasers, avs)
+            task.spawn(walkPath, {safe})
         end
-        moving = false
         return
     end
 
-    if (now - lastCheck) < 0.12 then return end
+    -- throttle proactive checks to every 0.15s
+    if (now - lastCheck) < 0.15 then return end
     lastCheck = now
 
-    -- proactive: flee if we'll be hit soon OR laser tip is approaching
     local shouldMove = anyDanger(px, pz, lasers, avs, LOOKAHEAD)
-    if not shouldMove then
-        for i, l in ipairs(lasers) do
-            local lv   = l.CFrame.LookVector
-            local av   = avs[i]
-            -- predict laser tip position in 0.35s
-            local pa   = math.atan2(lv.Z, lv.X) + av * 60 * 0.35
-            local tipX = l.Position.X + math.cos(pa) * PROX_TRIGGER
-            local tipZ = l.Position.Z + math.sin(pa) * PROX_TRIGGER
-            local ddx  = px - tipX
-            local ddz  = pz - tipZ
-            if math.sqrt(ddx*ddx + ddz*ddz) < LASER_HALF_W + 3 then
-                shouldMove = true; break
-            end
-        end
-    end
+                    or anyApproaching(px, pz, lasers, avs)
 
     updateVis(nil, nil, lasers, avs)
 
-    if shouldMove and not moving then
+    if shouldMove then
         local safe = findSafe(lasers, avs)
         if safe then
-            local path = buildPath(hrp.Position, safe, lasers, avs)
-            updateVis(safe, path, lasers, avs)
-            task.spawn(walkPath, path)
+            lastSafe = safe
+            -- only abort and re-path if the new target is significantly different
+            local shouldReplan = not moving
+            if moving and lastSafe then
+                local dd = (safe - lastSafe).Magnitude
+                if dd > 6 then shouldReplan = true end
+            end
+            if shouldReplan then
+                if moving then abortWalk() end
+                local path = buildPath(hrp.Position, safe, lasers, avs)
+                updateVis(safe, path, lasers, avs)
+                task.spawn(walkPath, path)
+            end
         end
     end
 end)
 
-print("[LaserBot] v4.0.0 running")
+print("[LaserBot] v4.1.0 running — no teleport, human movement")
