@@ -1,40 +1,45 @@
 -- ==========================================
--- MOVEMENT SCRIPT v19
+-- MOVEMENT SCRIPT v20
 -- ==========================================
--- CHANGES FROM v18:
+-- CHANGES FROM v19:
 --
--- 1. ARENA HARDCODED from real map data:
---    - Arena Part: workspace["Laser Game Map"]["Cylinder.005"]
---    - Arena Size: 77.43, 2.381, 77.43 (cylinder, so XZ radius = 77.43/2 = 38.715)
---    - Arena CFrame position: -178.238647, 40.161911, 12.4262772 (identity rotation)
---    - mapCenter is now this exact world position (not mapPart.Position live lookup)
---    - ARENA_FLOOR_Y = 40.161911 + 2.381/2 = ~41.35 (top surface of the cylinder)
---    - safeRadius hardcoded to 33 studs (38.715 - 5.7 margin from edge)
+-- 1. SAFE ZONE SCORING SYSTEM (new):
+--    - Instead of just moving to mapCenter when safe,
+--      the bot now constantly scores 24 positions around
+--      the arena and moves to the one furthest from ALL
+--      laser sweep paths (weighted by TTI).
+--    - This means the bot is NEVER caught standing in a
+--      bad spot — it always pre-positions in the gap.
 --
--- 2. PLAYER MAX POSITION hardcoded from real data:
---    - You gave: -161, 45, -20 as the furthest the player should move
---    - This is ~17.5 studs from center on X, ~32.2 studs on Z
---    - safeRadius is conservatively capped at 33 to stay inside this boundary
+-- 2. MULTI-LASER GAP POSITIONING:
+--    - getBestSafePos() samples 24 angular positions at
+--      configurable radius rings (inner/outer) and picks
+--      the highest-scored position considering every
+--      active laser's current + predicted sweep direction.
+--    - Score = sum of angular distances from each laser's
+--      forward vector, weighted by 1/TTI (closer lasers
+--      matter more).
 --
--- 3. LASER PATH hardcoded:
---    - Laser folder: workspace.Lasers.ActiveLasers
---    - Laser name prefix: "Laser_" (hashtag number after # changes each instance)
---    - Laser Size: 117.208, 0.810, 1.621 (very long thin beam, sweeps flat)
---    - PAD_Z reduced to 0.9 (beam is only 1.62 studs thick, tight but real)
---    - PAD_X reduced to 0.6 (beam is 117 studs long, X padding only for player width)
---    - PAD_Y kept at 2.6 (jump clearance)
+-- 3. IMPROVED TTI PREDICTION:
+--    - TTI now uses futureLaserCF lookahead to check
+--      if the predicted laser position in 0.3s still
+--      threatens the player, reducing false early jumps.
+--    - Added CONFIRM_TTI_LOOKAHEAD = 0.3 tunable.
 --
--- 4. AGGRO_DISTANCE increased to 60 (laser is 117 studs long, tip can be far)
---    VIZ_RANGE increased to 80 for same reason.
---    RESET_WORLD_DIST increased to 120 so lasers are never dropped prematurely.
+-- 4. LASER SWEEP DIRECTION AWARENESS:
+--    - Bot now checks if a laser is sweeping TOWARD or
+--      AWAY from the player using angVelY sign + relative
+--      angle, and only triggers jump when sweeping toward.
+--    - Reduces unnecessary jumps when laser already passed.
 --
--- 5. JUMP_TRIGGER_DISTANCE tuned to 4.0 (beam is thin, trigger tighter)
---    FAST_TTI kept at 0.55
---    FAR_SIDE_DIST increased to 20 (wider arena = need to move further to clear beam)
+-- 5. RING SAMPLING for getBestSafePos():
+--    - Checks two rings: INNER_RADIUS (12) and OUTER_RADIUS (28)
+--    - Prefers inner ring (more escape routes available)
+--      unless outer ring scores significantly better.
 --
--- 6. Arena check now uses hardcoded floor Y and radius instead of live Part reads.
+-- 6. All previous v19 features retained.
 -- ==========================================
-print("[Movement] v19 loaded")
+print("[Movement] v20 loaded")
 
 local Players    = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -44,56 +49,47 @@ local character = player.Character or player.CharacterAdded:Wait()
 local humanoid  = character:WaitForChild("Humanoid")
 local rootPart  = character:WaitForChild("HumanoidRootPart")
 
--- Arena Part (still needed for fallback / sanity)
 local mapPart      = workspace:WaitForChild("Laser Game Map"):WaitForChild("Cylinder.005")
 local lasersFolder = workspace:WaitForChild("Lasers"):WaitForChild("ActiveLasers")
 
--- ---- Hardcoded arena constants from real map data ----
--- CFrame position of Cylinder.005 (identity rotation so position = center)
+-- ---- Hardcoded arena constants ----
 local MAP_CENTER_X  = -178.238647
 local MAP_CENTER_Y  =   40.161911
 local MAP_CENTER_Z  =   12.4262772
-
--- Cylinder size 77.43 x 2.381 x 77.43
--- Floor top surface = center Y + half height
 local ARENA_FLOOR_Y = MAP_CENTER_Y + (2.381 / 2)   -- ~41.353
-
--- XZ radius of the cylinder = 77.43 / 2 = 38.715
--- Safe play radius: leave ~5.7 studs margin from edge
 local ARENA_PLAY_RADIUS = 33.0
-
--- Player max boundary hint: -161, 45, -20
--- Distance from center to that point = sqrt((178-161)^2 + (12-(-20))^2) = sqrt(289+1024) ~36.2
--- We stay inside 33 which is safely inside that boundary.
 
 local mapCenter = Vector3.new(MAP_CENTER_X, ARENA_FLOOR_Y + 0.5, MAP_CENTER_Z)
 local safeRadius = ARENA_PLAY_RADIUS
 
--- Arena boundary check tolerances
-local ARENA_XZ_RADIUS = ARENA_PLAY_RADIUS + 6   -- slightly loose for boundary detection
-local ARENA_Y_MARGIN  = 8                        -- allow some air above floor
+local ARENA_XZ_RADIUS = ARENA_PLAY_RADIUS + 6
+local ARENA_Y_MARGIN  = 8
 
--- ---- Tuning ----
--- Laser is 117 x 0.81 x 1.62 studs — long thin beam sweeping flat
-local JUMP_TRIGGER_DISTANCE = 4.0     -- beam is thin, jump when very close in Z
+-- ---- Safe zone scoring ----
+local SCORE_ANGLES      = 24      -- how many positions to score around the arena
+local INNER_RADIUS      = 12      -- inner ring radius
+local OUTER_RADIUS      = 28      -- outer ring radius
+local OUTER_BONUS_THRESH = 3.0   -- outer ring must score this much better to be preferred
+local SCORE_UPDATE_RATE = 0.12   -- seconds between safe pos recalculations
+
+-- ---- Jump / TTI tuning ----
+local JUMP_TRIGGER_DISTANCE = 4.0
 local APPROACH_START        = 14
-local AGGRO_DISTANCE        = 60      -- long beam, tip can be far away
+local AGGRO_DISTANCE        = 60
 local VIZ_RANGE             = 80
 local JUMP_COOLDOWN         = 0.35
 local PASS_CONFIRM_DIST     = 8
 local LASER_MOVE_THRESHOLD  = 0.4
-local RESET_WORLD_DIST      = 120     -- beam is 117 studs, never prune it early
+local RESET_WORLD_DIST      = 120
 local TIGHT_CLEARANCE       = 1.8
 local FAST_TTI              = 0.55
 local AIRDASH_COOLDOWN      = 0.6
 local AIRDASH_CHECK_START   = 0.15
-local FAR_SIDE_DIST         = 20      -- wider arena needs further jump target
+local FAR_SIDE_DIST         = 20
 local MIN_CROSS_AHEAD       = 4
+local CONFIRM_TTI_LOOKAHEAD = 0.3  -- NEW: confirm threat still exists N seconds ahead
 
--- Hit-box paddings for laser (117.208 x 0.810 x 1.621)
--- X = along beam length: player is small vs beam length, only need player half-width
--- Y = jump clearance
--- Z = beam thickness (1.621) + player radius — keep tight
+-- Hit-box paddings
 local PAD_X = 0.6
 local PAD_Y = 2.6
 local PAD_Z = 0.9
@@ -103,7 +99,7 @@ local MAX_CROSS_DIST  = 14
 local CROSS_BOTH_DIST = 18
 local CROSS_OVERSHOOT = 5
 
--- Planner (visualisation only)
+-- Planner
 local PLAN_INTERVAL   = 0.4
 local PLAN_STEPS      = 3
 local PLAN_CANDIDATES = 8
@@ -130,6 +126,10 @@ local currentPlan  = nil
 local lastMoveTarget     = nil
 local MOVE_RETARGET_DIST = 1.5
 
+-- Safe pos cache
+local lastSafePosTime = 0
+local cachedSafePos   = nil
+
 local function smartMoveTo(pos)
 	if lastMoveTarget then
 		local dx = pos.X - lastMoveTarget.X
@@ -154,8 +154,8 @@ screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 screenGui.Parent         = player.PlayerGui
 
 local hudFrame = Instance.new("Frame")
-hudFrame.Size                   = UDim2.new(0, 220, 0, 96)
-hudFrame.Position               = UDim2.new(1, -230, 0, 10)
+hudFrame.Size                   = UDim2.new(0, 240, 0, 116)
+hudFrame.Position               = UDim2.new(1, -250, 0, 10)
 hudFrame.BackgroundColor3       = Color3.fromRGB(12,12,12)
 hudFrame.BackgroundTransparency = 0.3
 hudFrame.BorderSizePixel        = 0
@@ -175,19 +175,21 @@ local function makeLabel(yoff, col, size, bold)
 	return l
 end
 
-local timerLabel = makeLabel(4,  Color3.fromRGB(80,220,160),  17, true)
-local jumpLabel  = makeLabel(26, Color3.fromRGB(255,200,60),  15, true)
-local crossLabel = makeLabel(48, Color3.fromRGB(120,200,255), 13, false)
-local dashLabel  = makeLabel(68, Color3.fromRGB(255,140,200), 13, false)
+local timerLabel  = makeLabel(4,  Color3.fromRGB(80,220,160),  17, true)
+local jumpLabel   = makeLabel(26, Color3.fromRGB(255,200,60),  15, true)
+local crossLabel  = makeLabel(48, Color3.fromRGB(120,200,255), 13, false)
+local dashLabel   = makeLabel(68, Color3.fromRGB(255,140,200), 13, false)
+local safeLabel   = makeLabel(88, Color3.fromRGB(180,255,180), 12, false)
 
 timerLabel.Text = "\xe2\x8f\xb1  0.0s"
 jumpLabel.Text  = "\xf0\x9f\xa6\x98 Jumps: 0"
 crossLabel.Text = "\xe2\x9c\x96 No crossing"
 dashLabel.Text  = "\xe2\x9a\xa1 Dash: ready"
+safeLabel.Text  = "\xf0\x9f\x9f\xa2 Safe pos: center"
 
 local statusLabel = Instance.new("TextLabel")
-statusLabel.Size                   = UDim2.new(0,220, 0,22)
-statusLabel.Position               = UDim2.new(1,-230, 0,110)
+statusLabel.Size                   = UDim2.new(0,240, 0,22)
+statusLabel.Position               = UDim2.new(1,-250, 0,130)
 statusLabel.BackgroundColor3       = Color3.fromRGB(12,12,12)
 statusLabel.BackgroundTransparency = 0.3
 statusLabel.BorderSizePixel        = 0
@@ -222,6 +224,13 @@ for i = 1, VIZ_STEPS do
 	p.Material=Enum.Material.Neon; p.Shape=Enum.PartType.Ball
 	p.Transparency=1; p.Parent=vizFolder; vizParts[i]=p
 end
+
+-- Safe pos marker (new in v20)
+local safePosMarker = Instance.new("Part")
+safePosMarker.Size=Vector3.new(1.2,1.2,1.2); safePosMarker.Anchored=true
+safePosMarker.CanCollide=false; safePosMarker.Material=Enum.Material.Neon
+safePosMarker.Shape=Enum.PartType.Ball; safePosMarker.Color=Color3.fromRGB(0,255,120)
+safePosMarker.Transparency=1; safePosMarker.Parent=vizFolder
 
 local crossMarker = Instance.new("Part")
 crossMarker.Size=Vector3.new(1.5,1.5,1.5); crossMarker.Anchored=true
@@ -259,7 +268,7 @@ local function hideArc()
 	for _,p in ipairs(vizParts) do p.Transparency=1 end
 end
 local function hideAll()
-	hideArc(); hidePlan(); crossMarker.Transparency=1
+	hideArc(); hidePlan(); crossMarker.Transparency=1; safePosMarker.Transparency=1
 end
 
 local function showPlanViz(waypoints)
@@ -283,7 +292,7 @@ local function showPlanViz(waypoints)
 end
 
 -- ==========================================
--- ARENA CHECK  (uses hardcoded constants)
+-- ARENA CHECK
 -- ==========================================
 local function checkOnArena()
 	local pos  = rootPart.Position
@@ -319,6 +328,94 @@ local function futureLaserCF(laser, vel, angVelY, t)
 	local baseAngle   = math.atan2(laser.CFrame.LookVector.X, laser.CFrame.LookVector.Z)
 	local futureAngle = baseAngle + angVelY * t
 	return CFrame.new(futurePos) * CFrame.Angles(0, futureAngle, 0)
+end
+
+-- ==========================================
+-- SAFE ZONE SCORING (NEW in v20)
+-- ==========================================
+-- Score a world position against all active threats.
+-- Higher score = safer. Weighted by 1/TTI so closer
+-- lasers matter more.
+local function scorePosition(pos, threats)
+	local score = 0
+	for _, t in ipairs(threats) do
+		local laser   = t.laser
+		local vel     = t.velocity
+		local angVelY = t.angVelY
+		local tti     = math.max(t.tti, 0.05)
+		local weight  = 1 / tti  -- closer laser = higher weight
+
+		-- Current laser threat
+		local objPos  = laser.CFrame:PointToObjectSpace(pos)
+		local distZ   = math.abs(objPos.Z)
+
+		-- Predicted laser threat at TTI/2
+		local halfT   = tti * 0.5
+		local fcf     = futureLaserCF(laser, vel, angVelY, halfT)
+		local futureObjPos = fcf:PointToObjectSpace(pos)
+		local futureDistZ  = math.abs(futureObjPos.Z)
+
+		-- Score contribution: distance from laser beam in Z (perpendicular to sweep)
+		-- Plus angular separation from laser forward vector in XZ plane
+		local laserFwd   = Vector3.new(laser.CFrame.LookVector.X, 0, laser.CFrame.LookVector.Z)
+		local toPos      = Vector3.new(pos.X - laser.Position.X, 0, pos.Z - laser.Position.Z)
+		local angSep     = 0
+		if laserFwd.Magnitude > 0.01 and toPos.Magnitude > 0.01 then
+			local dot = math.clamp(laserFwd.Unit:Dot(toPos.Unit), -1, 1)
+			angSep = math.acos(dot) -- 0 = directly in beam path, pi = opposite side
+		end
+
+		score = score + (distZ * 0.6 + futureDistZ * 0.4 + angSep * 2.0) * weight
+	end
+	return score
+end
+
+local function getBestSafePos(threats, now)
+	-- Return cached if recent enough
+	if cachedSafePos and (now - lastSafePosTime) < SCORE_UPDATE_RATE then
+		return cachedSafePos
+	end
+
+	if #threats == 0 then
+		cachedSafePos = mapCenter
+		lastSafePosTime = now
+		return mapCenter
+	end
+
+	local bestScore  = -math.huge
+	local bestPos    = mapCenter
+	local floorY     = ARENA_FLOOR_Y + 0.5
+
+	-- Score two rings
+	for _, radius in ipairs({INNER_RADIUS, OUTER_RADIUS}) do
+		local ringBest  = -math.huge
+		local ringPos   = mapCenter
+
+		for i = 0, SCORE_ANGLES - 1 do
+			local angle = (i / SCORE_ANGLES) * math.pi * 2
+			local candidate = Vector3.new(
+				MAP_CENTER_X + math.cos(angle) * radius,
+				floorY,
+				MAP_CENTER_Z + math.sin(angle) * radius
+			)
+			local s = scorePosition(candidate, threats)
+			if s > ringBest then
+				ringBest = s
+				ringPos  = candidate
+			end
+		end
+
+		-- Prefer inner ring unless outer is significantly better
+		local effectiveScore = (radius == INNER_RADIUS) and ringBest or (ringBest - OUTER_BONUS_THRESH)
+		if effectiveScore > bestScore then
+			bestScore = effectiveScore
+			bestPos   = ringPos
+		end
+	end
+
+	cachedSafePos   = bestPos
+	lastSafePosTime = now
+	return bestPos
 end
 
 -- ==========================================
@@ -366,6 +463,24 @@ local function farSideTarget(laser, side)
 	laserZ = laserZ.Unit
 	local tgt = laser.Position + laserZ * (-side * FAR_SIDE_DIST)
 	return clampToSafe(Vector3.new(tgt.X, ARENA_FLOOR_Y+0.5, tgt.Z))
+end
+
+-- NEW v20: check if laser is sweeping TOWARD player
+local function laserSweepingToward(laser, angVelY)
+	local playerPos = rootPart.Position
+	local toPlayer  = Vector3.new(
+		playerPos.X - laser.Position.X, 0,
+		playerPos.Z - laser.Position.Z)
+	if toPlayer.Magnitude < 0.01 then return true end
+	local fwd = Vector3.new(laser.CFrame.LookVector.X, 0, laser.CFrame.LookVector.Z)
+	if fwd.Magnitude < 0.01 then return true end
+	-- Right of the laser beam = cross product with up
+	local right = Vector3.new(fwd.Z, 0, -fwd.X)
+	local playerRight = right:Dot(toPlayer)
+	-- If angVelY > 0 laser sweeps CCW (left), if playerRight > 0 player is to the right
+	-- Sweeping toward player when signs match
+	local sweepingToward = (angVelY * playerRight) > 0
+	return sweepingToward
 end
 
 -- ==========================================
@@ -481,6 +596,20 @@ local function collectThreats(dt, now)
 		if localZ>AGGRO_DISTANCE then continue end
 
 		local tti = speed>0.1 and (localZ/speed) or localZ
+
+		-- NEW v20: confirm threat still valid at CONFIRM_TTI_LOOKAHEAD seconds ahead
+		-- If the predicted future position is already past the player, skip
+		local confirmThreat = true
+		if speed > 0.1 then
+			local fcf = futureLaserCF(item, tipVel, angVelY, CONFIRM_TTI_LOOKAHEAD)
+			local futureObjPos = fcf:PointToObjectSpace(playerPos)
+			-- If future localZ is LARGER than current (laser moving away), skip threat
+			if math.abs(futureObjPos.Z) > localZ + 1.5 then
+				confirmThreat = false
+			end
+		end
+		if not confirmThreat then continue end
+
 		if sp then
 			print(string.format("[DBG] '%s' lZ=%.1f TTI=%.2f spd=%.1f",item.Name,localZ,tti,speed))
 		end
@@ -532,7 +661,7 @@ local function findCrossing(threats)
 end
 
 -- ==========================================
--- LOOKAHEAD PLANNER (visualisation only)
+-- LOOKAHEAD PLANNER
 -- ==========================================
 local function runPlanner(threats)
 	if #threats==0 then return nil end
@@ -602,6 +731,11 @@ RunService.Heartbeat:Connect(function(dt)
 
 	local threats, vizLasers = collectThreats(dt, now)
 
+	-- Update safe pos marker
+	local bestSafe = getBestSafePos(threats, now)
+	safePosMarker.Position  = bestSafe
+	safePosMarker.Transparency = 0.3
+
 	local state   = humanoid:GetState()
 	local isInAir = state==Enum.HumanoidStateType.Freefall
 	            or state==Enum.HumanoidStateType.Jumping
@@ -619,6 +753,12 @@ RunService.Heartbeat:Connect(function(dt)
 	dashLabel.TextColor3 = dashReady
 		and Color3.fromRGB(255,100,200) or Color3.fromRGB(120,120,120)
 
+	-- Update safe pos HUD label
+	local dxS = bestSafe.X - MAP_CENTER_X
+	local dzS = bestSafe.Z - MAP_CENTER_Z
+	local distFromCenter = math.sqrt(dxS*dxS + dzS*dzS)
+	safeLabel.Text = string.format("\xf0\x9f\x9f\xa2 SafePos: %.1f studs", distFromCenter)
+
 	if #vizLasers>0 then
 		local vL={};  local vV={};  local vA={}
 		for _,v in ipairs(vizLasers) do
@@ -635,9 +775,10 @@ RunService.Heartbeat:Connect(function(dt)
 		hidePlan()
 		crossLabel.Text       = "\xe2\x9c\x96 No crossing"
 		crossLabel.TextColor3 = Color3.fromRGB(120,200,255)
-		setStatus("\xe2\x97\x89 Safe \xe2\x80\x93 holding centre", Color3.fromRGB(80,220,160))
+		setStatus("\xe2\x97\x89 Safe \xe2\x80\x93 optimal pos", Color3.fromRGB(80,220,160))
+		-- v20: move to scored best safe position instead of just mapCenter
 		if not isInAir then
-			smartMoveTo(mapCenter)
+			smartMoveTo(bestSafe)
 		end
 		currentPlan=nil; return
 	end
@@ -656,6 +797,9 @@ RunService.Heartbeat:Connect(function(dt)
 
 	table.sort(threats, function(a,b) return a.tti<b.tti end)
 	local primary = threats[1]
+
+	-- v20: Only treat as real threat if laser is sweeping TOWARD player
+	local sweepingToward = laserSweepingToward(primary.laser, primary.angVelY)
 
 	if now-lastPlanTime >= PLAN_INTERVAL then
 		lastPlanTime=now; currentPlan=runPlanner(threats)
@@ -721,7 +865,8 @@ RunService.Heartbeat:Connect(function(dt)
 	local flatTgt    = Vector3.new(toTgt.X,0,toTgt.Z)
 	local predictDir = flatTgt.Magnitude>0.01 and flatTgt.Unit or realMoveDir
 
-	local triggerNow = canJump
+	-- v20: only trigger jump if laser is actually sweeping toward player
+	local triggerNow = canJump and sweepingToward
 		and (primary.localZ<=JUMP_TRIGGER_DISTANCE or primary.tti<=FAST_TTI)
 
 	if triggerNow then
@@ -742,10 +887,13 @@ RunService.Heartbeat:Connect(function(dt)
 			setStatus("\xe2\x97\x89 Waiting for safe arc\xe2\x80\xa6", Color3.fromRGB(255,120,40))
 		end
 	elseif primary.localZ<=APPROACH_START then
-		smartMoveTo(jumpTarget)
+		-- v20: approach to scored safe pos, not just jumpTarget
+		local approachTarget = sweepingToward and jumpTarget or bestSafe
+		smartMoveTo(approachTarget)
 		setStatus("\xe2\x97\x89 Approaching", Color3.fromRGB(255,180,40))
 	else
-		smartMoveTo(mapCenter)
-		setStatus("\xe2\x97\x89 Holding centre", Color3.fromRGB(140,180,255))
+		-- v20: idle at best scored safe position
+		smartMoveTo(bestSafe)
+		setStatus("\xe2\x97\x89 Optimal pos", Color3.fromRGB(140,180,255))
 	end
 end)
