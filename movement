@@ -1,43 +1,36 @@
 -- ==========================================
--- MOVEMENT SCRIPT v29
+-- MOVEMENT SCRIPT v30
 -- ==========================================
--- CHANGES FROM v28:
+-- CHANGES FROM v29:
 --
---  FIX 1 - Signed angular velocity (futureCF drift fix)
---    av was computed as a cross product magnitude and lost
---    its sign when the laser rotated past 180 degrees.
---    Now computed as the signed Y component of the cross
---    product, so prediction never drifts direction.
+--  NEW STRATEGY: Run-toward-laser + jump over it
+--    Instead of hunting for a "safe spot" and jumping
+--    away from lasers, the bot now:
+--      1. Identifies the primary threat laser
+--      2. Computes the point on the laser's centre-line
+--         that is directly "in front" of the bot
+--      3. Runs toward that crossing point
+--      4. Jumps OVER the laser (direction = through it)
+--         so it lands safely on the far side
+--    This works much better with multiple lasers because
+--    the space just behind a laser you just jumped over
+--    is always clear.
 --
---  FIX 2 - scorePos uses per-threat arrival time
---    Each threat is now evaluated at t = clamp(tti, 0.1, 2.0)
---    (the actual moment it arrives at the player) instead of
---    a fixed t = tti*0.5 fraction that was wrong for both
---    very short and very long TTI values.
+--  LIVE ARC VISUALIZER
+--    The planned jump arc (green dashed line in the image)
+--    is now redrawn every Heartbeat frame so it continuously
+--    tracks the rotating laser in real time, exactly like
+--    the reference image shows.
 --
---  FIX 3 - Safe-spot cache invalidated on laser movement
---    getBestSafe now invalidates cachedSafe if any tracked
---    threat has moved more than 2 studs since the last cache
---    fill, rather than blindly trusting a 100ms-old result.
+--  APPROACH logic
+--    When primary TTI <= APPROACH_TTI (2.5s) the bot runs
+--    toward the laser crossing point instead of the generic
+--    safe spot. The crossing point is clamped to be just
+--    in front of the laser (not on top of it).
 --
---  FIX 4 - mustJumpToAvoid checks ALL threats
---    Previously only the primary threat was checked.
---    Now loops over every active threat and returns true
---    if ANY of them requires a jump.
---
---  FIX 5 - Dive ChangeState retry loop
---    hum:ChangeState(Jumping) is now retried up to 3
---    consecutive Heartbeat frames if the humanoid is not
---    yet in Freefall/Jumping state, catching cases where
---    Roblox silently drops the first call.
---
---  FIX 6 - Denser dive fall sampling
---    DIVE_FALL_STEPS raised from 8 to 20 to close the
---    gaps a fast-rotating laser can slip through.
---
---  All v28 arc physics, viz, HUD, and dive planning unchanged.
+--  All v29 reliability fixes (FIX 1-6) kept intact.
 -- ==========================================
-print("[Movement] v29 loaded")
+print("[Movement] v30 loaded")
 
 local Players    = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -66,12 +59,14 @@ local JUMP_MAX_TTI   = 0.65
 local JUMP_MIN_TTI   = 0.22
 local JUMP_COOLDOWN  = 0.40
 local REPOSITION_TTI = 4.0
+local APPROACH_TTI   = 2.5    -- start running toward laser at this TTI
+local APPROACH_STOP  = 3.5    -- studs in front of laser to stop (crossing point offset)
 local SAFE_RING_1    = 10
 local SAFE_RING_2    = 18
 local SAFE_RING_3    = 26
 local SAFE_ANGLES    = 72
 local SAFE_HZ        = 0.10
-local SAFE_MOVE_INVAL= 2.0   -- FIX 3: invalidate cache if any laser moves this many studs
+local SAFE_MOVE_INVAL= 2.0
 local REACT_MIN      = 0.05
 local REACT_MAX      = 0.11
 local PAD_X = 0.7
@@ -87,14 +82,10 @@ local MOVE_THRESH    = 0.5
 local WARMUP_FRAMES  = 3
 local TTI_ALPHA      = 0.35
 
--- Dive arc simulation: fractions of tAir at which to try diving
-local DIVE_FRACTIONS = {0.30, 0.50, 0.70}
--- FIX 6: raised from 8 to 20 for denser post-dive fall sampling
+local DIVE_FRACTIONS  = {0.30, 0.50, 0.70}
 local DIVE_FALL_STEPS = 20
--- Arc sample resolution
-local ARC_DOTS = 20
--- FIX 5: max retry frames for dive ChangeState
-local DIVE_RETRY_MAX = 3
+local ARC_DOTS        = 20
+local DIVE_RETRY_MAX  = 3
 
 -- Full 360 sweep every 8 degrees
 local SWEEP_DIRS = {}
@@ -113,6 +104,7 @@ local COL_SAFE   = Color3.fromRGB(0,   255, 80)
 local COL_WARN   = Color3.fromRGB(255, 220,  0)
 local COL_DANGER = Color3.fromRGB(255,  50, 50)
 local COL_PASSED = Color3.fromRGB( 80,  80, 80)
+local COL_ARC    = Color3.fromRGB(0,   255, 80)   -- live arc colour
 local TTI_WARN   = 1.5
 local TTI_DANGER = 0.5
 
@@ -124,7 +116,6 @@ local lastSide    = setmetatable({}, {__mode="k"})
 local passed      = setmetatable({}, {__mode="k"})
 local frameCount  = setmetatable({}, {__mode="k"})
 local smoothedTTI = setmetatable({}, {__mode="k"})
--- FIX 3: track laser positions at last cache fill
 local cachePos    = setmetatable({}, {__mode="k"})
 
 local lastJumpTime = 0
@@ -137,11 +128,9 @@ local jumpPendDir    = Vector3.new(1,0,0)
 local jumpPendTarget = Vector3.new(0,0,0)
 local jumpPendDive   = nil
 
--- Dive execution state
--- FIX 5: track retry attempts
-local diveScheduled    = false
-local diveTriggerTime  = 0
-local diveRetryCount   = 0
+local diveScheduled   = false
+local diveTriggerTime = 0
+local diveRetryCount  = 0
 
 local lastSafeTime = 0
 local cachedSafe   = nil
@@ -151,10 +140,10 @@ local lastMovePos  = nil
 -- LASER HITBOX VIZ CACHE
 -- ==========================================
 local laserVizCache = setmetatable({}, {__mode="k"})
-local vizRoot = workspace:FindFirstChild("LaserViz29")
+local vizRoot = workspace:FindFirstChild("LaserViz30")
 if vizRoot then vizRoot:Destroy() end
 vizRoot = Instance.new("Folder")
-vizRoot.Name = "LaserViz29"
+vizRoot.Name = "LaserViz30"
 vizRoot.Parent = workspace
 
 local function getOrCreateViz(laser)
@@ -233,12 +222,117 @@ local function purgeDeadViz()
 end
 
 -- ==========================================
--- PATH VISUALIZER
+-- LIVE ARC VISUALIZER
+-- Redrawn every frame so the arc tracks the laser
 -- ==========================================
-local pathRoot = workspace:FindFirstChild("PathViz29")
+local arcVizRoot = workspace:FindFirstChild("ArcViz30")
+if arcVizRoot then arcVizRoot:Destroy() end
+arcVizRoot = Instance.new("Folder")
+arcVizRoot.Name = "ArcViz30"
+arcVizRoot.Parent = workspace
+
+local LIVE_ARC_DOTS = 24
+local liveArcParts  = {}
+local liveLandDot   = Instance.new("Part")
+liveLandDot.Size = Vector3.new(1.6,1.6,1.6); liveLandDot.Anchored = true
+liveLandDot.CanCollide = false; liveLandDot.CastShadow = false
+liveLandDot.Material = Enum.Material.Neon; liveLandDot.Shape = Enum.PartType.Ball
+liveLandDot.Color = Color3.fromRGB(255,220,30); liveLandDot.Transparency = 1
+liveLandDot.Parent = arcVizRoot
+
+local liveCrossDot = Instance.new("Part")
+liveCrossDot.Size = Vector3.new(1.2,1.2,1.2); liveCrossDot.Anchored = true
+liveCrossDot.CanCollide = false; liveCrossDot.CastShadow = false
+liveCrossDot.Material = Enum.Material.Neon; liveCrossDot.Shape = Enum.PartType.Ball
+liveCrossDot.Color = Color3.fromRGB(255,100,30); liveCrossDot.Transparency = 1
+liveCrossDot.Parent = arcVizRoot
+
+for i = 1, LIVE_ARC_DOTS do
+    local p = Instance.new("Part")
+    p.Size = Vector3.new(DOT_SZ, DOT_SZ, DOT_SZ); p.Anchored = true
+    p.CanCollide = false; p.CastShadow = false
+    p.Material = Enum.Material.Neon; p.Shape = Enum.PartType.Ball
+    p.Color = COL_ARC; p.Transparency = 1
+    p.Parent = arcVizRoot
+    liveArcParts[i] = p
+end
+
+-- Draw a live arc from startPos in dir, optionally with a dive
+local function drawLiveArc(startPos, dir, diveFrac)
+    if not dir or dir.Magnitude < 0.01 then
+        for _, p in ipairs(liveArcParts) do p.Transparency = 1 end
+        liveLandDot.Transparency = 1; liveCrossDot.Transparency = 1
+        return
+    end
+    local g  = workspace.Gravity
+    local jp = hum.UseJumpPower and hum.JumpPower or math.sqrt(2*g*hum.JumpHeight)
+    local tAir = (2*jp)/g
+    local ws = hum.WalkSpeed
+    local md = Vector3.new(dir.X, 0, dir.Z).Unit
+
+    if diveFrac then
+        local tDive = diveFrac * tAir
+        local p1    = math.floor(LIVE_ARC_DOTS * diveFrac)
+        local divePos
+        for i = 1, p1 do
+            local t = tDive * (i / p1)
+            liveArcParts[i].Position = Vector3.new(
+                startPos.X + md.X*ws*t,
+                startPos.Y + jp*t - 0.5*g*t*t,
+                startPos.Z + md.Z*ws*t)
+            liveArcParts[i].Transparency = 0.15
+            liveArcParts[i].Color = COL_ARC
+            if i == p1 then divePos = liveArcParts[i].Position end
+        end
+        if divePos then
+            local vY = jp - g*tDive
+            local h  = divePos.Y - FLOOR_Y
+            local disc = vY*vY + 2*g*h
+            local tF = disc >= 0 and (vY + math.sqrt(disc))/g or 0
+            local p2 = LIVE_ARC_DOTS - p1
+            for i = 1, p2 do
+                local tf = tF * (i/p2)
+                local idx = p1 + i
+                if liveArcParts[idx] then
+                    liveArcParts[idx].Position = Vector3.new(
+                        divePos.X,
+                        divePos.Y + vY*tf - 0.5*g*tf*tf,
+                        divePos.Z)
+                    liveArcParts[idx].Transparency = 0.15
+                    liveArcParts[idx].Color = Color3.fromRGB(255,80,200)
+                end
+            end
+            liveLandDot.Position = Vector3.new(divePos.X, FLOOR_Y+0.5, divePos.Z)
+            liveLandDot.Transparency = 0.2
+        end
+    else
+        local ts = tAir / LIVE_ARC_DOTS
+        for i = 1, LIVE_ARC_DOTS do
+            local t = i * ts
+            liveArcParts[i].Position = Vector3.new(
+                startPos.X + md.X*ws*t,
+                startPos.Y + jp*t - 0.5*g*t*t,
+                startPos.Z + md.Z*ws*t)
+            liveArcParts[i].Transparency = 0.15
+            liveArcParts[i].Color = COL_ARC
+        end
+        local lp = Vector3.new(startPos.X+md.X*ws*tAir, FLOOR_Y+0.5, startPos.Z+md.Z*ws*tAir)
+        liveLandDot.Position = lp; liveLandDot.Transparency = 0.2
+    end
+end
+
+local function hideLiveArc()
+    for _, p in ipairs(liveArcParts) do p.Transparency = 1 end
+    liveLandDot.Transparency = 1; liveCrossDot.Transparency = 1
+end
+
+-- ==========================================
+-- PATH VISUALIZER (multi-step plan)
+-- ==========================================
+local pathRoot = workspace:FindFirstChild("PathViz30")
 if pathRoot then pathRoot:Destroy() end
 pathRoot = Instance.new("Folder")
-pathRoot.Name = "PathViz29"; pathRoot.Parent = workspace
+pathRoot.Name = "PathViz30"; pathRoot.Parent = workspace
 
 local ARC_COLORS  = {Color3.fromRGB(0,255,80),  Color3.fromRGB(0,200,255), Color3.fromRGB(200,255,0)}
 local LAND_COLORS = {Color3.fromRGB(255,220,30), Color3.fromRGB(255,140,0), Color3.fromRGB(200,0,255)}
@@ -372,12 +466,12 @@ end
 -- HUD
 -- ==========================================
 local sg=Instance.new("ScreenGui")
-sg.Name="MovHUD29"; sg.ResetOnSpawn=false
+sg.Name="MovHUD30"; sg.ResetOnSpawn=false
 sg.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
 sg.Parent=player.PlayerGui
 
 local frame=Instance.new("Frame")
-frame.Size=UDim2.new(0,260,0,130)
+frame.Size=UDim2.new(0,260,0,148)
 frame.Position=UDim2.new(1,-272,0,10)
 frame.BackgroundColor3=Color3.fromRGB(8,8,8)
 frame.BackgroundTransparency=0.25
@@ -397,9 +491,11 @@ local lJumps  = lbl(28, Color3.fromRGB(255,200,60),  15, true)
 local lStatus = lbl(52, Color3.fromRGB(200,200,200), 13, false)
 local lTTI    = lbl(74, Color3.fromRGB(120,200,255), 12, false)
 local lDive   = lbl(96, Color3.fromRGB(255,80,200),  12, false)
+local lMode   = lbl(116,Color3.fromRGB(255,200,80),  12, false)
 
-lTimer.Text="[v29] 0.0s"; lJumps.Text="Jumps: 0"
-lStatus.Text="Waiting..."; lTTI.Text="TTI: -"; lDive.Text="Dive: -"
+lTimer.Text="[v30] 0.0s"; lJumps.Text="Jumps: 0"
+lStatus.Text="Waiting..."; lTTI.Text="TTI: -"
+lDive.Text="Dive: -"; lMode.Text="Mode: -"
 
 local function setStatus(t,c)
     lStatus.Text=t; lStatus.TextColor3=c or Color3.fromRGB(200,200,200)
@@ -421,7 +517,7 @@ local function clampArena(pos)
     return pos
 end
 
--- FIX 1: signed angular velocity — use Y component of cross product directly
+-- FIX 1: signed angular velocity
 local function futureCF(laser, vel, av, t)
     local fp = laser.Position + vel * t
     local ba = math.atan2(laser.CFrame.LookVector.X, laser.CFrame.LookVector.Z)
@@ -433,12 +529,10 @@ local function getLaserMotion(laser, oldCF, dt)
     local tv = (laser.Position - oldCF.Position) / dt
     local of = Vector3.new(oldCF.LookVector.X, 0, oldCF.LookVector.Z)
     local nf = Vector3.new(laser.CFrame.LookVector.X, 0, laser.CFrame.LookVector.Z)
-    -- FIX 1: signed av — Y of cross product keeps correct sign through 180 degrees
     local av = 0
     if of.Magnitude > 0.01 and nf.Magnitude > 0.01 then
-        av = of:Cross(nf).Y / dt   -- signed: positive = CCW, negative = CW
+        av = of:Cross(nf).Y / dt
     end
-    -- Velocity already linear; av is now signed so no sign(av) multiply needed
     local pd = Vector3.new(nf.Z, 0, -nf.X) * av
     return tv + pd * (laser.Size.Z / 2), av
 end
@@ -469,7 +563,7 @@ local function pointHitsLaser(th, worldPos, futureT)
 end
 
 -- ==========================================
--- ARC SAFETY CHECK  (unchanged from v28 except DIVE_FALL_STEPS now 20)
+-- ARC SAFETY CHECK
 -- Returns: safe(bool), minGap(studs), diveAt(nil or fraction)
 -- ==========================================
 local function arcSafeWithDive(threats, dir, startPos, timeOffset)
@@ -488,7 +582,6 @@ local function arcSafeWithDive(threats, dir, startPos, timeOffset)
         return false
     end
 
-    -- Option A: normal full arc
     local normalSafe = true
     local ts = tAir / ARC_DOTS
     for i = 1, ARC_DOTS do
@@ -502,7 +595,6 @@ local function arcSafeWithDive(threats, dir, startPos, timeOffset)
     end
     if normalSafe then return true, 999, nil end
 
-    -- Options B/C/D: dive fractions
     for _, frac in ipairs(DIVE_FRACTIONS) do
         local tDive    = frac * tAir
         local diveSafe = true
@@ -523,7 +615,6 @@ local function arcSafeWithDive(threats, dir, startPos, timeOffset)
         if disc < 0 then continue end
         local tFall = (vYatDive + math.sqrt(disc)) / g
 
-        -- FIX 6: 20 steps instead of 8
         for i = 1, DIVE_FALL_STEPS do
             local tf = tFall * (i / DIVE_FALL_STEPS)
             local tp = Vector3.new(
@@ -544,7 +635,75 @@ local function arcSafeWithDive(threats, dir, startPos, timeOffset)
 end
 
 -- ==========================================
--- NECESSITY CHECK  (FIX 4: checks ALL threats)
+-- NEW: GET JUMP-OVER-LASER DIRECTION
+-- Computes the direction that takes the bot
+-- straight through the primary laser to the other side.
+-- Returns: dir (Vector3), crossPoint (Vector3), safe (bool), diveAt
+-- ==========================================
+local function getJumpOverLaserDir(threat, threats, fromPos)
+    fromPos = fromPos or root.Position
+    local laser = threat.laser
+
+    -- The laser's forward axis (local Z) is the sweep direction.
+    -- The bot needs to cross the laser's local X axis.
+    -- Crossing direction = laser's local X normal (perpendicular to laser length)
+    -- pointing from bot's side toward the far side.
+    local laserCF = laser.CFrame
+    -- Local position of bot relative to laser
+    local localBot = laserCF:PointToObjectSpace(fromPos)
+
+    -- The crossing direction in world space is laser's right/left (X axis),
+    -- but we want to go THROUGH the laser (across its Z axis sweep).
+    -- Actually we want to jump along local -Z (toward the far side the laser came from).
+    -- Determine which side of the laser's X axis the bot is on.
+    local laserLook = Vector3.new(laserCF.LookVector.X, 0, laserCF.LookVector.Z)
+    if laserLook.Magnitude < 0.01 then return nil, nil, false, nil end
+    laserLook = laserLook.Unit
+
+    -- Jump direction = toward the laser then past it = laserLook direction
+    -- (pointing along the laser's sweep, which will carry us over it)
+    -- But we want to go perpendicular to the laser's length (cross it),
+    -- so use the laser's right vector in world space:
+    local laserRight = Vector3.new(laserCF.RightVector.X, 0, laserCF.RightVector.Z)
+    if laserRight.Magnitude < 0.01 then return nil, nil, false, nil end
+    laserRight = laserRight.Unit
+
+    -- Choose direction: go toward the side the laser is sweeping FROM
+    -- (so we land on the safe trailing side)
+    -- av > 0 means CCW; the trailing safe side is determined by sign of av
+    local sweepDir
+    if math.abs(threat.av) > MIN_AV then
+        -- Trailing side is opposite to angular velocity direction
+        sweepDir = laserRight * (threat.av > 0 and -1 or 1)
+    else
+        -- Linear motion: go along velocity direction
+        local vFlat = Vector3.new(threat.vel.X, 0, threat.vel.Z)
+        sweepDir = vFlat.Magnitude > 0.1 and vFlat.Unit or laserRight
+    end
+
+    -- The crossing point: project bot onto laser centre-line,
+    -- then place crossing point at laser's centre at the bot's X depth
+    -- (i.e. the nearest point on the laser centre-line to the bot),
+    -- offset APPROACH_STOP studs in front of laser
+    local laserCentre = Vector3.new(laser.Position.X, FLOOR_Y+0.5, laser.Position.Z)
+    -- Nearest point on infinite laser line to the bot
+    local botFlat = Vector3.new(fromPos.X, FLOOR_Y+0.5, fromPos.Z)
+    local toCentre = laserCentre - botFlat
+    local dotVal = toCentre:Dot(sweepDir)
+    -- The crossing point is along sweepDir from bot
+    local crossPoint = botFlat + sweepDir * dotVal
+
+    -- Show crossing point dot
+    liveCrossDot.Position = crossPoint
+    liveCrossDot.Transparency = 0.2
+
+    -- Safe: check if arc in sweepDir direction clears all threats
+    local safe, _, diveAt = arcSafeWithDive(threats, sweepDir, fromPos, 0)
+    return sweepDir, crossPoint, safe, diveAt
+end
+
+-- ==========================================
+-- NECESSITY CHECK (checks ALL threats)
 -- ==========================================
 local function mustJumpToAvoid(threats, currentPos, targetPos)
     local _,_,_,ws = getJump()
@@ -556,7 +715,6 @@ local function mustJumpToAvoid(threats, currentPos, targetPos)
         if walkDist > 0.5 then walkDir = diff.Unit end
     end
 
-    -- FIX 4: loop over every threat, not just primary
     for _, threat in ipairs(threats) do
         if threat.spd <= MIN_SPD and math.abs(threat.av) <= MIN_AV then continue end
         local laser   = threat.laser
@@ -574,7 +732,7 @@ local function mustJumpToAvoid(threats, currentPos, targetPos)
             if math.abs(lp.X)<laser.Size.X/2+PAD_X
             and math.abs(lp.Y)<laser.Size.Y/2+PAD_Y
             and math.abs(lp.Z)<laser.Size.Z/2+PAD_Z then
-                return true   -- this threat requires a jump
+                return true
             end
         end
     end
@@ -582,8 +740,7 @@ local function mustJumpToAvoid(threats, currentPos, targetPos)
 end
 
 -- ==========================================
--- BEST JUMP DIRECTION
--- Returns: dir, safe, gap, diveAt
+-- BEST JUMP DIRECTION (fallback sweep)
 -- ==========================================
 local function getBestJumpDir(threats, fromPos, timeOffset)
     fromPos    = fromPos    or root.Position
@@ -616,45 +773,37 @@ local function getBestJumpDir(threats, fromPos, timeOffset)
 end
 
 -- ==========================================
--- SAFE POSITION  (FIX 2 + FIX 3)
+-- SAFE POSITION (FIX 2 + FIX 3)
 -- ==========================================
-
--- FIX 2: evaluate each threat at its actual arrival time, not a fixed fraction
 local function scorePos(pos, threats)
     if #threats == 0 then return math.huge end
     local worstClearance = math.huge
     for _, th in ipairs(threats) do
-        -- FIX 2: use clamped real TTI as the evaluation time
         local t   = math.max(math.min(th.tti, 2.0), 0.1)
         local fcf = futureCF(th.laser, th.vel, th.av, t)
         local op  = fcf:PointToObjectSpace(pos)
         local bX  = th.laser.Size.X/2 + PAD_X + 1.5
         local bZ  = th.laser.Size.Z/2 + PAD_Z + 1.5
-        local clearX     = math.abs(op.X) - bX
-        local clearZ     = math.abs(op.Z) - bZ
-        local clearance  = math.min(clearX, clearZ)
-        local weight     = 1.0 / math.max(th.tti, 0.1)
-        worstClearance   = math.min(worstClearance, clearance / weight)
+        local clearance = math.min(math.abs(op.X) - bX, math.abs(op.Z) - bZ)
+        local weight    = 1.0 / math.max(th.tti, 0.1)
+        worstClearance  = math.min(worstClearance, clearance / weight)
     end
     return worstClearance
 end
 
--- FIX 3: invalidate cache if any threat laser has moved significantly since last fill
 local function cacheStale(threats)
     for _, th in ipairs(threats) do
         local prev = cachePos[th.laser]
         if prev then
-            local d = (th.laser.Position - prev).Magnitude
-            if d > SAFE_MOVE_INVAL then return true end
+            if (th.laser.Position - prev).Magnitude > SAFE_MOVE_INVAL then return true end
         else
-            return true  -- new laser, never cached
+            return true
         end
     end
     return false
 end
 
 local function getBestSafe(threats, now)
-    -- FIX 3: invalidate on movement in addition to time
     if cachedSafe and (now - lastSafeTime) < SAFE_HZ and not cacheStale(threats) then
         return cachedSafe
     end
@@ -677,10 +826,7 @@ local function getBestSafe(threats, now)
     end
     local sc = scorePos(mapCenter, threats)
     if sc > best then bestPos = mapCenter end
-    -- FIX 3: snapshot laser positions for next stale check
-    for _, th in ipairs(threats) do
-        cachePos[th.laser] = th.laser.Position
-    end
+    for _, th in ipairs(threats) do cachePos[th.laser] = th.laser.Position end
     cachedSafe = bestPos; lastSafeTime = now
     return bestPos
 end
@@ -708,9 +854,14 @@ local function planAndDrawPath(threats, now)
         end
         if not bestThreat or bestTTI > REPOSITION_TTI then break end
 
+        -- Try over-laser direction first for viz
+        local dir, _, safe, diveAt = getJumpOverLaserDir(bestThreat, threats, curPos)
+        if not dir or not safe then
+            dir, safe, _, diveAt = getBestJumpDir(threats, curPos, timeAcc)
+        end
+
         local safePos = getBestSafe(threats, now)
         drawWalkSeg(step, curPos, safePos)
-        local dir, safe, _, diveAt = getBestJumpDir(threats, safePos, timeAcc)
         local landPos = drawJumpArc(step, safePos, dir, jp, tAir, g, ws, diveAt)
         landPos = clampArena(Vector3.new(landPos.X, FLOOR_Y+0.5, landPos.Z))
         table.insert(plan, {fromPos=safePos, dir=dir, landPos=landPos, safe=safe, tti=bestTTI, diveAt=diveAt})
@@ -826,16 +977,16 @@ end
 -- ==========================================
 RunService.Heartbeat:Connect(function(dt)
     if not char or hum.Health<=0 then
-        hidePath(); safeDot.Transparency=1
+        hidePath(); hideLiveArc(); safeDot.Transparency=1
         setStatus("Dead", Color3.fromRGB(255,80,80))
         clearMove(); diveScheduled=false; diveRetryCount=0; return
     end
 
     local now = tick()
-    lTimer.Text = string.format("[v29] %.1fs", now-runStart)
+    lTimer.Text = string.format("[v30] %.1fs", now-runStart)
 
     if not onArena() then
-        hidePath(); safeDot.Transparency=1
+        hidePath(); hideLiveArc(); safeDot.Transparency=1
         setStatus("Off arena", Color3.fromRGB(180,180,180))
         clearMove(); diveScheduled=false; diveRetryCount=0; return
     end
@@ -856,7 +1007,7 @@ RunService.Heartbeat:Connect(function(dt)
     safeDot.Position = bestSafe; safeDot.Transparency = 0.3
     planAndDrawPath(threats, now)
 
-    -- FIX 5: Dive retry — fire ChangeState and retry up to DIVE_RETRY_MAX frames
+    -- FIX 5: Dive retry
     if diveScheduled and now >= diveTriggerTime then
         if inAir then
             hum:ChangeState(Enum.HumanoidStateType.Jumping)
@@ -867,21 +1018,33 @@ RunService.Heartbeat:Connect(function(dt)
                 diveScheduled = false; diveRetryCount = 0
             end
         else
-            -- No longer in air — dive window missed, cancel
             diveScheduled = false; diveRetryCount = 0
             lDive.Text = "Dive: missed"
         end
     end
 
+    -- No threats
     if #threats == 0 then
         jumpPending = false; diveScheduled = false; diveRetryCount = 0
+        hideLiveArc()
         setStatus("Safe - holding", Color3.fromRGB(80,220,160))
-        lDive.Text = "Dive: -"
+        lDive.Text = "Dive: -"; lMode.Text = "Mode: idle"
         if not inAir then moveTo(bestSafe) end
         return
     end
 
     local primary = threats[1]
+
+    -- ---- LIVE ARC VIZ: always redrawn this frame ----
+    -- Show the planned over-laser arc tracking the laser in real time
+    do
+        local liveDir, _, liveSafe, liveDive = getJumpOverLaserDir(primary, threats, root.Position)
+        if liveDir then
+            drawLiveArc(root.Position, liveDir, liveDive)
+        else
+            hideLiveArc()
+        end
+    end
 
     if inAir then
         if jumpPending then moveTo(jumpPendTarget)
@@ -917,32 +1080,72 @@ RunService.Heartbeat:Connect(function(dt)
     end
 
     local inWindow   = primary.tti <= JUMP_MAX_TTI
+    local inApproach = primary.tti <= APPROACH_TTI
     local needsRepos = primary.tti >  REPOSITION_TTI
 
+    -- ---- APPROACH: run toward the laser crossing point ----
+    if inApproach and not inWindow and not jumpPending then
+        local overDir, crossPoint, overSafe, overDive =
+            getJumpOverLaserDir(primary, threats, root.Position)
+        if overDir and crossPoint then
+            -- Run to a position just in front of the crossing point
+            local toPoint = Vector3.new(crossPoint.X - root.Position.X, 0, crossPoint.Z - root.Position.Z)
+            local dist = toPoint.Magnitude
+            local runTarget
+            if dist > APPROACH_STOP then
+                -- Stop APPROACH_STOP studs before the laser
+                runTarget = clampArena(Vector3.new(
+                    root.Position.X + toPoint.Unit.X * (dist - APPROACH_STOP),
+                    FLOOR_Y + 0.5,
+                    root.Position.Z + toPoint.Unit.Z * (dist - APPROACH_STOP)))
+            else
+                runTarget = clampArena(crossPoint)
+            end
+            moveTo(runTarget)
+            setStatus(string.format("Approach %.2fs", primary.tti), Color3.fromRGB(255,200,80))
+            lMode.Text = overSafe and "Mode: over-laser" or "Mode: approach(unsafe)"
+            return
+        end
+    end
+
+    -- Reposition to safe spot when laser is far
     if needsRepos and not jumpPending then
         moveTo(bestSafe)
         setStatus(string.format("Reposition %.1fs", primary.tti), Color3.fromRGB(140,180,255))
+        lMode.Text = "Mode: reposition"
         return
     end
 
+    -- Jump window
     if inWindow and canJump and not jumpPending then
-        -- FIX 4: pass full threats list to mustJumpToAvoid
         local needsJump = mustJumpToAvoid(threats, root.Position, bestSafe)
         if not needsJump then
             moveTo(bestSafe)
             setStatus(string.format("No jump %.2fs", primary.tti), Color3.fromRGB(0,220,120))
+            lMode.Text = "Mode: dodge"
             return
         end
 
-        local dir, safe, _, diveAt = getBestJumpDir(threats, nil, 0)
+        -- Try over-laser jump first; fall back to sweep
+        local dir, safe, _, diveAt
+        local overDir, _, overSafe, overDive = getJumpOverLaserDir(primary, threats, root.Position)
+        if overDir and overSafe then
+            dir = overDir; safe = true; diveAt = overDive
+            lMode.Text = "Mode: OVER-LASER"
+        else
+            dir, safe, _, diveAt = getBestJumpDir(threats, nil, 0)
+            lMode.Text = "Mode: sweep-jump"
+        end
+
         local jp,tAir,g,ws = getJump()
         local landTarget
         if diveAt then
             local tDive = diveAt * tAir
             local md    = Vector3.new(dir.X,0,dir.Z).Unit
-            local diveX = root.Position.X + md.X*ws*tDive
-            local diveZ = root.Position.Z + md.Z*ws*tDive
-            landTarget  = clampArena(Vector3.new(diveX, FLOOR_Y+0.5, diveZ))
+            landTarget  = clampArena(Vector3.new(
+                root.Position.X + md.X*ws*tDive,
+                FLOOR_Y+0.5,
+                root.Position.Z + md.Z*ws*tDive))
         else
             local md = Vector3.new(dir.X,0,dir.Z).Unit
             landTarget = clampArena(Vector3.new(
@@ -984,5 +1187,6 @@ RunService.Heartbeat:Connect(function(dt)
     if not jumpPending then
         moveTo(bestSafe)
         setStatus(string.format("Holding %.2fs", primary.tti), Color3.fromRGB(140,180,255))
+        lMode.Text = "Mode: hold"
     end
 end)
