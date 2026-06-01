@@ -1,29 +1,40 @@
 -- ==========================================
--- MOVEMENT SCRIPT v18
+-- MOVEMENT SCRIPT v19
 -- ==========================================
--- ROOT CAUSE OF ERRATIC MOVEMENT (v17 and before):
+-- CHANGES FROM v18:
 --
--- 1. humanoid:MoveTo() was called EVERY HEARTBEAT FRAME on the ground.
---    Roblox MoveTo is not designed for that. Each call resets the internal
---    pathfinder and causes the character to jitter/spin as it recalculates
---    a new path 60 times per second. Fix: MoveTo is now called only ONCE
---    when the decision changes (target changed or state changed). A
---    "lastMoveTarget" variable tracks whether a new call is actually needed.
+-- 1. ARENA HARDCODED from real map data:
+--    - Arena Part: workspace["Laser Game Map"]["Cylinder.005"]
+--    - Arena Size: 77.43, 2.381, 77.43 (cylinder, so XZ radius = 77.43/2 = 38.715)
+--    - Arena CFrame position: -178.238647, 40.161911, 12.4262772 (identity rotation)
+--    - mapCenter is now this exact world position (not mapPart.Position live lookup)
+--    - ARENA_FLOOR_Y = 40.161911 + 2.381/2 = ~41.35 (top surface of the cylinder)
+--    - safeRadius hardcoded to 33 studs (38.715 - 5.7 margin from edge)
 --
--- 2. Crossing logic fired even when the player was already INSIDE the V.
---    findCrossing() returned the intersection point and the bot sprinted
---    toward it, which is the wrong side when standing between two converging
---    lasers. Fix: only treat it as a crossing jump if the intersection is
---    at least MIN_CROSS_AHEAD studs in FRONT of the player (dot product
---    against approach direction). If inside the V, treat each laser
---    independently and jump over the nearest one.
+-- 2. PLAYER MAX POSITION hardcoded from real data:
+--    - You gave: -161, 45, -20 as the furthest the player should move
+--    - This is ~17.5 studs from center on X, ~32.2 studs on Z
+--    - safeRadius is conservatively capped at 33 to stay inside this boundary
 --
--- 3. The lookahead planner's waypoints were used as MoveTo targets on the
---    ground (v16 regression that partially survived into v17). The planner
---    is now visualisation-only. It does NOT influence any MoveTo calls.
---    In-air, the character just steers toward farSideTarget (simple & reliable).
+-- 3. LASER PATH hardcoded:
+--    - Laser folder: workspace.Lasers.ActiveLasers
+--    - Laser name prefix: "Laser_" (hashtag number after # changes each instance)
+--    - Laser Size: 117.208, 0.810, 1.621 (very long thin beam, sweeps flat)
+--    - PAD_Z reduced to 0.9 (beam is only 1.62 studs thick, tight but real)
+--    - PAD_X reduced to 0.6 (beam is 117 studs long, X padding only for player width)
+--    - PAD_Y kept at 2.6 (jump clearance)
+--
+-- 4. AGGRO_DISTANCE increased to 60 (laser is 117 studs long, tip can be far)
+--    VIZ_RANGE increased to 80 for same reason.
+--    RESET_WORLD_DIST increased to 120 so lasers are never dropped prematurely.
+--
+-- 5. JUMP_TRIGGER_DISTANCE tuned to 4.0 (beam is thin, trigger tighter)
+--    FAST_TTI kept at 0.55
+--    FAR_SIDE_DIST increased to 20 (wider arena = need to move further to clear beam)
+--
+-- 6. Arena check now uses hardcoded floor Y and radius instead of live Part reads.
 -- ==========================================
-print("[Movement] v18 loaded")
+print("[Movement] v19 loaded")
 
 local Players    = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -33,36 +44,59 @@ local character = player.Character or player.CharacterAdded:Wait()
 local humanoid  = character:WaitForChild("Humanoid")
 local rootPart  = character:WaitForChild("HumanoidRootPart")
 
+-- Arena Part (still needed for fallback / sanity)
 local mapPart      = workspace:WaitForChild("Laser Game Map"):WaitForChild("Cylinder.005")
 local lasersFolder = workspace:WaitForChild("Lasers"):WaitForChild("ActiveLasers")
 
-local maxMapDimension = math.max(mapPart.Size.X, mapPart.Size.Y, mapPart.Size.Z)
-local safeRadius      = (maxMapDimension / 2) - 5
-local mapCenter       = mapPart.Position
-local ARENA_TOP       = mapPart.Position.Y + mapPart.Size.Y / 2
-local ARENA_Y_MARGIN  = 6
-local ARENA_XZ_RADIUS = (maxMapDimension / 2) + 4
+-- ---- Hardcoded arena constants from real map data ----
+-- CFrame position of Cylinder.005 (identity rotation so position = center)
+local MAP_CENTER_X  = -178.238647
+local MAP_CENTER_Y  =   40.161911
+local MAP_CENTER_Z  =   12.4262772
+
+-- Cylinder size 77.43 x 2.381 x 77.43
+-- Floor top surface = center Y + half height
+local ARENA_FLOOR_Y = MAP_CENTER_Y + (2.381 / 2)   -- ~41.353
+
+-- XZ radius of the cylinder = 77.43 / 2 = 38.715
+-- Safe play radius: leave ~5.7 studs margin from edge
+local ARENA_PLAY_RADIUS = 33.0
+
+-- Player max boundary hint: -161, 45, -20
+-- Distance from center to that point = sqrt((178-161)^2 + (12-(-20))^2) = sqrt(289+1024) ~36.2
+-- We stay inside 33 which is safely inside that boundary.
+
+local mapCenter = Vector3.new(MAP_CENTER_X, ARENA_FLOOR_Y + 0.5, MAP_CENTER_Z)
+local safeRadius = ARENA_PLAY_RADIUS
+
+-- Arena boundary check tolerances
+local ARENA_XZ_RADIUS = ARENA_PLAY_RADIUS + 6   -- slightly loose for boundary detection
+local ARENA_Y_MARGIN  = 8                        -- allow some air above floor
 
 -- ---- Tuning ----
-local JUMP_TRIGGER_DISTANCE = 5.5
-local APPROACH_START        = 12
-local AGGRO_DISTANCE        = 20
-local VIZ_RANGE             = 40
+-- Laser is 117 x 0.81 x 1.62 studs — long thin beam sweeping flat
+local JUMP_TRIGGER_DISTANCE = 4.0     -- beam is thin, jump when very close in Z
+local APPROACH_START        = 14
+local AGGRO_DISTANCE        = 60      -- long beam, tip can be far away
+local VIZ_RANGE             = 80
 local JUMP_COOLDOWN         = 0.35
 local PASS_CONFIRM_DIST     = 8
 local LASER_MOVE_THRESHOLD  = 0.4
-local RESET_WORLD_DIST      = 24
+local RESET_WORLD_DIST      = 120     -- beam is 117 studs, never prune it early
 local TIGHT_CLEARANCE       = 1.8
 local FAST_TTI              = 0.55
 local AIRDASH_COOLDOWN      = 0.6
 local AIRDASH_CHECK_START   = 0.15
-local FAR_SIDE_DIST         = 14
-local MIN_CROSS_AHEAD       = 4    -- crossing point must be this many studs ahead
+local FAR_SIDE_DIST         = 20      -- wider arena needs further jump target
+local MIN_CROSS_AHEAD       = 4
 
--- Hit-box paddings
-local PAD_X = 1.4
+-- Hit-box paddings for laser (117.208 x 0.810 x 1.621)
+-- X = along beam length: player is small vs beam length, only need player half-width
+-- Y = jump clearance
+-- Z = beam thickness (1.621) + player radius — keep tight
+local PAD_X = 0.6
 local PAD_Y = 2.6
-local PAD_Z = 0.6
+local PAD_Z = 0.9
 
 -- Crossing
 local MAX_CROSS_DIST  = 14
@@ -93,10 +127,8 @@ local didAirdash      = false
 local lastPlanTime = 0
 local currentPlan  = nil
 
--- FIX 1: track last MoveTo so we don't spam it every frame
-local lastMoveTarget  = nil
-local lastMoveTargetY = nil   -- ignore Y drift
-local MOVE_RETARGET_DIST = 1.5  -- only re-call MoveTo if target shifted > this
+local lastMoveTarget     = nil
+local MOVE_RETARGET_DIST = 1.5
 
 local function smartMoveTo(pos)
 	if lastMoveTarget then
@@ -251,13 +283,16 @@ local function showPlanViz(waypoints)
 end
 
 -- ==========================================
--- ARENA CHECK
+-- ARENA CHECK  (uses hardcoded constants)
 -- ==========================================
 local function checkOnArena()
 	local pos  = rootPart.Position
-	local flat = Vector3.new(pos.X-mapCenter.X, 0, pos.Z-mapCenter.Z)
-	return flat.Magnitude<=ARENA_XZ_RADIUS
-		and pos.Y>=ARENA_TOP-1 and pos.Y<=ARENA_TOP+ARENA_Y_MARGIN
+	local dx   = pos.X - MAP_CENTER_X
+	local dz   = pos.Z - MAP_CENTER_Z
+	local flatD = math.sqrt(dx*dx + dz*dz)
+	return flatD <= ARENA_XZ_RADIUS
+		and pos.Y >= ARENA_FLOOR_Y - 1
+		and pos.Y <= ARENA_FLOOR_Y + ARENA_Y_MARGIN
 end
 
 -- ==========================================
@@ -298,18 +333,19 @@ local function findLaserIntersection(laserA, laserB)
 	if math.abs(denom)<0.01 then return nil end
 	local dx=bx-ax; local dz=bz-az
 	local t=(dx*bdz - dz*bdx)/denom
-	return Vector3.new(ax+t*adx, ARENA_TOP+0.5, az+t*adz), t
+	return Vector3.new(ax+t*adx, ARENA_FLOOR_Y+0.5, az+t*adz), t
 end
 
 -- ==========================================
 -- HELPERS
 -- ==========================================
 local function clampToSafe(pos)
-	local off  = pos - mapCenter
-	local flat = Vector3.new(off.X,0,off.Z)
-	if flat.Magnitude>safeRadius then
-		local c = flat.Unit*safeRadius
-		return Vector3.new(mapCenter.X+c.X, pos.Y, mapCenter.Z+c.Z)
+	local dx  = pos.X - MAP_CENTER_X
+	local dz  = pos.Z - MAP_CENTER_Z
+	local mag = math.sqrt(dx*dx + dz*dz)
+	if mag > safeRadius then
+		local scale = safeRadius / mag
+		return Vector3.new(MAP_CENTER_X + dx*scale, pos.Y, MAP_CENTER_Z + dz*scale)
 	end
 	return pos
 end
@@ -329,7 +365,7 @@ local function farSideTarget(laser, side)
 	if laserZ.Magnitude < 0.01 then laserZ = Vector3.new(1,0,0) end
 	laserZ = laserZ.Unit
 	local tgt = laser.Position + laserZ * (-side * FAR_SIDE_DIST)
-	return clampToSafe(Vector3.new(tgt.X, ARENA_TOP+0.5, tgt.Z))
+	return clampToSafe(Vector3.new(tgt.X, ARENA_FLOOR_Y+0.5, tgt.Z))
 end
 
 -- ==========================================
@@ -461,7 +497,7 @@ local function collectThreats(dt, now)
 end
 
 -- ==========================================
--- CROSSING DETECTION  (FIX 2: must be ahead)
+-- CROSSING DETECTION
 -- ==========================================
 local function findCrossing(threats)
 	local playerPos = rootPart.Position
@@ -476,19 +512,16 @@ local function findCrossing(threats)
 			if not pt then continue end
 			if t and t<-5 then continue end
 
-			-- FIX 2: check the crossing point is actually AHEAD of us, not behind/inside
 			local toP = Vector3.new(pt.X-playerPos.X, 0, pt.Z-playerPos.Z)
-			if toP.Magnitude < MIN_CROSS_AHEAD then continue end  -- we're already past/inside
+			if toP.Magnitude < MIN_CROSS_AHEAD then continue end
 
-			-- It must be in front of us (toward where the laser is pushing us)
-			-- Use primary threat direction as "forward"
 			local approachDir = Vector3.new(
 				a.laser.Position.X - playerPos.X, 0,
 				a.laser.Position.Z - playerPos.Z)
 			if approachDir.Magnitude > 0.01 then
 				approachDir = approachDir.Unit
 				local dotAhead = toP.Unit:Dot(approachDir)
-				if dotAhead < 0 then continue end  -- crossing is behind us
+				if dotAhead < 0 then continue end
 			end
 
 			local d = toP.Magnitude
@@ -499,7 +532,7 @@ local function findCrossing(threats)
 end
 
 -- ==========================================
--- LOOKAHEAD PLANNER  (visualisation only)
+-- LOOKAHEAD PLANNER (visualisation only)
 -- ==========================================
 local function runPlanner(threats)
 	if #threats==0 then return nil end
@@ -586,7 +619,6 @@ RunService.Heartbeat:Connect(function(dt)
 	dashLabel.TextColor3 = dashReady
 		and Color3.fromRGB(255,100,200) or Color3.fromRGB(120,120,120)
 
-	-- Arc visualiser
 	if #vizLasers>0 then
 		local vL={};  local vV={};  local vA={}
 		for _,v in ipairs(vizLasers) do
@@ -599,19 +631,17 @@ RunService.Heartbeat:Connect(function(dt)
 		hideArc()
 	end
 
-	-- No threats: stand still at centre
 	if #threats==0 then
 		hidePlan()
 		crossLabel.Text       = "\xe2\x9c\x96 No crossing"
 		crossLabel.TextColor3 = Color3.fromRGB(120,200,255)
 		setStatus("\xe2\x97\x89 Safe \xe2\x80\x93 holding centre", Color3.fromRGB(80,220,160))
 		if not isInAir then
-			smartMoveTo(mapCenter)   -- FIX 1: only once unless target changes
+			smartMoveTo(mapCenter)
 		end
 		currentPlan=nil; return
 	end
 
-	-- Crossing check
 	local crossPoint,crossA,crossB = findCrossing(threats)
 	local isCrossing = crossPoint~=nil
 	if isCrossing then
@@ -627,13 +657,12 @@ RunService.Heartbeat:Connect(function(dt)
 	table.sort(threats, function(a,b) return a.tti<b.tti end)
 	local primary = threats[1]
 
-	-- Planner (background, viz only)
 	if now-lastPlanTime >= PLAN_INTERVAL then
 		lastPlanTime=now; currentPlan=runPlanner(threats)
 	end
 	if currentPlan then showPlanViz(currentPlan.waypoints) else hidePlan() end
 
-	-- ---- Air-dash ----
+	-- Air-dash
 	if isInAir and dashReady then
 		local chkL={primary.laser}; local chkV={primary.velocity}; local chkA={primary.angVelY}
 		local airSafe = predictArc(chkL,chkV,chkA, realMoveDir, nil, false, 0)
@@ -662,13 +691,13 @@ RunService.Heartbeat:Connect(function(dt)
 		return
 	end
 
-	-- ---- Already in air: steer to far side (simple, no planner) ----
+	-- Already in air: steer to far side
 	if isInAir then
 		smartMoveTo(farSideTarget(primary.laser, primary.side))
 		return
 	end
 
-	-- ---- On ground: pick one clear jump target ----
+	-- On ground: pick jump target
 	local jumpTarget
 	local checkLasers={};  local checkVels={};  local checkAVs={}
 
@@ -679,7 +708,7 @@ RunService.Heartbeat:Connect(function(dt)
 		if toC.Magnitude>0.01 then toC=toC.Unit end
 		jumpTarget = clampToSafe(Vector3.new(
 			crossPoint.X + toC.X*CROSS_OVERSHOOT,
-			ARENA_TOP+0.5,
+			ARENA_FLOOR_Y+0.5,
 			crossPoint.Z + toC.Z*CROSS_OVERSHOOT))
 		table.insert(checkLasers, crossA.laser);  table.insert(checkVels, crossA.velocity);  table.insert(checkAVs, crossA.angVelY)
 		table.insert(checkLasers, crossB.laser);  table.insert(checkVels, crossB.velocity);  table.insert(checkAVs, crossB.angVelY)
@@ -704,7 +733,7 @@ RunService.Heartbeat:Connect(function(dt)
 			lastJumpTime=now; jumpCount=jumpCount+1
 			jumpLabel.Text = string.format("\xf0\x9f\xa6\x98 Jumps: %d", jumpCount)
 			clearMoveTarget()
-			humanoid:MoveTo(jumpTarget)   -- direct call on jump trigger
+			humanoid:MoveTo(jumpTarget)
 			humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
 			setStatus(
 				isCrossing and "\xe2\x97\x89 CROSSING JUMP!" or "\xe2\x97\x89 Jumping!",
@@ -713,11 +742,10 @@ RunService.Heartbeat:Connect(function(dt)
 			setStatus("\xe2\x97\x89 Waiting for safe arc\xe2\x80\xa6", Color3.fromRGB(255,120,40))
 		end
 	elseif primary.localZ<=APPROACH_START then
-		-- Walk toward jump target but do NOT jump
-		smartMoveTo(jumpTarget)   -- FIX 1: only called when target changes
+		smartMoveTo(jumpTarget)
 		setStatus("\xe2\x97\x89 Approaching", Color3.fromRGB(255,180,40))
 	else
-		smartMoveTo(mapCenter)    -- FIX 1: only called when target changes
+		smartMoveTo(mapCenter)
 		setStatus("\xe2\x97\x89 Holding centre", Color3.fromRGB(140,180,255))
 	end
 end)
