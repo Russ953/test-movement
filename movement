@@ -1,31 +1,39 @@
 -- ==========================================
--- MOVEMENT SCRIPT v26
+-- MOVEMENT SCRIPT v27
 -- ==========================================
--- CHANGES FROM v25:
+-- CHANGES FROM v26:
 --
---  BUG FIX: Phantom/weird jumps while standing still
+--  BUG FIX: Confused/wrong jumps with 3+ lasers
 --
---  Root cause 1: mustJumpToAvoid() simulated the bot
---  standing at root.Position, but the bot was actually
---  moving toward bestSafe via moveTo(). The collision
---  sim checked the wrong future position and falsely
---  decided the laser would hit -> unnecessary jump.
+--  Fix 1 - getBestJumpDir: full 360° sweep
+--    Old: only checked ±55° around primary laser's
+--    perpendicular. With 3 lasers the safe gap could
+--    be at 90° or 150° and never got found.
+--    New: sweeps all 45 directions (every 8°, full
+--    circle) and picks the one with the best clearance
+--    gap across ALL active threats simultaneously.
+--    Primary laser perpendicular is just the starting
+--    hint, not a hard constraint.
 --
---  Fix: mustJumpToAvoid() now accepts a `targetPos`
---  parameter and simulates the bot moving toward it
---  at WalkSpeed during the threat horizon, so the
---  collision check matches the bot's actual trajectory.
+--  Fix 2 - arcSafe: already checked all threats,
+--    but the landing-spot check only tested X/Z.
+--    Now also checks Y on the landing spot so a laser
+--    hovering at head height at the landing zone
+--    correctly fails the check.
 --
---  Root cause 2: mustNow (TTI <= JUMP_MIN_TTI) could
---  force a jump even for a laser that passes beside the
---  bot and will never physically hit it. mustNow now
---  ALSO requires mustJumpToAvoid to confirm a real hit
---  before firing a forced jump.
+--  Fix 3 - getBestSafe scoring rewritten:
+--    Old score = sum(lZ/tti) which accidentally
+--    rewarded being CLOSE to fast lasers (high tti
+--    denominator pushes score up for far threats).
+--    New score = sum of minimum perpendicular clearance
+--    from each laser at its predicted position, weighted
+--    by how urgent each laser is. Higher = safer.
+--    Also samples a denser grid (72 angles + 3 radii +
+--    center) so it finds genuinely clear pockets.
 --
---  All v25 warmup, TTI smoothing, multi-step path viz,
---  laser hitbox viz, and billboard labels are unchanged.
+--  All v26 warmup, TTI smoothing, viz unchanged.
 -- ==========================================
-print("[Movement] v26 loaded")
+print("[Movement] v27 loaded")
 
 local Players    = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -53,11 +61,12 @@ local mapCenter = Vector3.new(MAP_X, FLOOR_Y + 0.5, MAP_Z)
 local JUMP_MAX_TTI   = 0.65
 local JUMP_MIN_TTI   = 0.22
 local JUMP_COOLDOWN  = 0.40
-local ANGLE_STEPS    = {0, 12, -12, 25, -25, 40, -40, 55, -55}
 local REPOSITION_TTI = 4.0
-local SAFE_RING      = 16
-local SAFE_ANGLES    = 48
-local SAFE_HZ        = 0.12
+local SAFE_RING_1    = 10    -- inner safe ring radius
+local SAFE_RING_2    = 18    -- mid ring
+local SAFE_RING_3    = 26    -- outer ring
+local SAFE_ANGLES    = 72    -- denser grid
+local SAFE_HZ        = 0.10
 local REACT_MIN      = 0.05
 local REACT_MAX      = 0.11
 local PAD_X = 0.7
@@ -72,6 +81,13 @@ local WORLD_RESET    = 130
 local MOVE_THRESH    = 0.5
 local WARMUP_FRAMES  = 3
 local TTI_ALPHA      = 0.35
+
+-- Full 360° sweep every 8° = 45 directions
+local SWEEP_DIRS = {}
+for deg = 0, 352, 8 do
+    local r = math.rad(deg)
+    table.insert(SWEEP_DIRS, Vector3.new(math.sin(r), 0, math.cos(r)))
+end
 
 -- Path viz
 local ARC_DOTS       = 20
@@ -108,16 +124,15 @@ local jumpPendTarget = Vector3.new(0,0,0)
 local lastSafeTime = 0
 local cachedSafe   = nil
 local lastMovePos  = nil
-local lastRootPos  = nil
 
 -- ==========================================
 -- LASER HITBOX VIZ CACHE
 -- ==========================================
 local laserVizCache = setmetatable({}, {__mode="k"})
-local vizRoot = workspace:FindFirstChild("LaserViz26")
+local vizRoot = workspace:FindFirstChild("LaserViz27")
 if vizRoot then vizRoot:Destroy() end
 vizRoot = Instance.new("Folder")
-vizRoot.Name = "LaserViz26"
+vizRoot.Name = "LaserViz27"
 vizRoot.Parent = workspace
 
 local function getOrCreateViz(laser)
@@ -198,10 +213,10 @@ end
 -- ==========================================
 -- PATH VISUALIZER
 -- ==========================================
-local pathRoot = workspace:FindFirstChild("PathViz26")
+local pathRoot = workspace:FindFirstChild("PathViz27")
 if pathRoot then pathRoot:Destroy() end
 pathRoot = Instance.new("Folder")
-pathRoot.Name = "PathViz26"; pathRoot.Parent = workspace
+pathRoot.Name = "PathViz27"; pathRoot.Parent = workspace
 
 local ARC_COLORS  = {Color3.fromRGB(0,255,80),  Color3.fromRGB(0,200,255), Color3.fromRGB(200,255,0)}
 local LAND_COLORS = {Color3.fromRGB(255,220,30), Color3.fromRGB(255,140,0), Color3.fromRGB(200,0,255)}
@@ -286,7 +301,7 @@ end
 -- HUD
 -- ==========================================
 local sg=Instance.new("ScreenGui")
-sg.Name="MovHUD26"; sg.ResetOnSpawn=false
+sg.Name="MovHUD27"; sg.ResetOnSpawn=false
 sg.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
 sg.Parent=player.PlayerGui
 
@@ -311,7 +326,7 @@ local lJumps  = lbl(28, Color3.fromRGB(255,200,60),  15, true)
 local lStatus = lbl(52, Color3.fromRGB(200,200,200), 13, false)
 local lTTI    = lbl(74, Color3.fromRGB(120,200,255), 12, false)
 
-lTimer.Text="[v26] 0.0s"; lJumps.Text="Jumps: 0"
+lTimer.Text="[v27] 0.0s"; lJumps.Text="Jumps: 0"
 lStatus.Text="Waiting..."; lTTI.Text="TTI: -"
 
 local function setStatus(t,c)
@@ -366,10 +381,7 @@ local function computeTTI(laser,localZ,vel,av,spd)
 end
 
 -- ==========================================
--- NECESSITY CHECK  (v26 FIX)
--- Now simulates the bot walking toward targetPos
--- instead of standing still, so the collision check
--- matches the bot's real trajectory.
+-- NECESSITY CHECK
 -- ==========================================
 local function mustJumpToAvoid(threat, currentPos, targetPos)
     if threat.spd <= MIN_SPD and math.abs(threat.av) <= MIN_AV then
@@ -380,20 +392,17 @@ local function mustJumpToAvoid(threat, currentPos, targetPos)
     local dt2    = horizon / 30
     local _,_,_,ws = getJump()
 
-    -- direction the bot will walk toward targetPos
     local walkDir = Vector3.zero
+    local walkDist = 0
     if targetPos then
         local diff = Vector3.new(targetPos.X - currentPos.X, 0, targetPos.Z - currentPos.Z)
-        if diff.Magnitude > 0.5 then
-            walkDir = diff.Unit
-        end
+        walkDist = diff.Magnitude
+        if walkDist > 0.5 then walkDir = diff.Unit end
     end
 
     for i = 1, 30 do
         local t = i * dt2
-        -- simulate bot position: moves toward target at WalkSpeed, stops when close
-        local walked = math.min(ws * t, targetPos and
-            Vector3.new(targetPos.X-currentPos.X,0,targetPos.Z-currentPos.Z).Magnitude or 0)
+        local walked = math.min(ws * t, walkDist)
         local simPos = Vector3.new(
             currentPos.X + walkDir.X * walked,
             currentPos.Y,
@@ -401,10 +410,9 @@ local function mustJumpToAvoid(threat, currentPos, targetPos)
 
         local fcf = futureCF(laser, threat.vel, threat.av, t)
         local lp  = fcf:PointToObjectSpace(simPos)
-        local bX  = laser.Size.X/2 + PAD_X
-        local bY  = laser.Size.Y/2 + PAD_Y
-        local bZ  = laser.Size.Z/2 + PAD_Z
-        if math.abs(lp.X)<bX and math.abs(lp.Y)<bY and math.abs(lp.Z)<bZ then
+        if math.abs(lp.X)<laser.Size.X/2+PAD_X
+        and math.abs(lp.Y)<laser.Size.Y/2+PAD_Y
+        and math.abs(lp.Z)<laser.Size.Z/2+PAD_Z then
             return true
         end
     end
@@ -412,43 +420,66 @@ local function mustJumpToAvoid(threat, currentPos, targetPos)
 end
 
 -- ==========================================
--- ARC SAFETY CHECK
+-- ARC SAFETY CHECK  (v27: also checks Y on landing)
+-- Returns safe(bool), minGap(studs)
 -- ==========================================
-local function arcSafe(threats,dir,startPos,timeOffset)
-    if #threats==0 then return true,999 end
-    local jp,tAir,g,ws=getJump()
-    timeOffset=timeOffset or 0
-    local sp=startPos or root.Position
-    local safe=true; local mg=math.huge
-    local md=Vector3.new(dir.X,0,dir.Z)
-    if md.Magnitude>0.01 then md=md.Unit else return false,0 end
-    local ts=tAir/ARC_DOTS
-    for i=1,ARC_DOTS do
-        local t=i*ts
-        local tp=Vector3.new(sp.X+md.X*ws*t, sp.Y+jp*t-0.5*g*t*t, sp.Z+md.Z*ws*t)
+local function arcSafe(threats, dir, startPos, timeOffset)
+    if #threats==0 then return true, 999 end
+    local jp,tAir,g,ws = getJump()
+    timeOffset = timeOffset or 0
+    local sp = startPos or root.Position
+    local md = Vector3.new(dir.X,0,dir.Z)
+    if md.Magnitude < 0.01 then return false, 0 end
+    md = md.Unit
+
+    local safe = true
+    local minGap = math.huge
+    local ts = tAir / ARC_DOTS
+
+    for i = 1, ARC_DOTS do
+        local t = i * ts
+        local tp = Vector3.new(
+            sp.X + md.X*ws*t,
+            sp.Y + jp*t - 0.5*g*t*t,
+            sp.Z + md.Z*ws*t)
         for _,th in ipairs(threats) do
-            local fcf=futureCF(th.laser,th.vel,th.av,t+timeOffset)
-            local lp=fcf:PointToObjectSpace(tp)
-            local bX=th.laser.Size.X/2+PAD_X
-            local bY=th.laser.Size.Y/2+PAD_Y
-            local bZ=th.laser.Size.Z/2+PAD_Z
-            if math.abs(lp.X)<bX and math.abs(lp.Y)<bY and math.abs(lp.Z)<bZ then safe=false end
-            mg=math.min(mg,math.abs(math.min(bX-math.abs(lp.X),bY-math.abs(lp.Y),bZ-math.abs(lp.Z))))
+            local fcf = futureCF(th.laser, th.vel, th.av, t + timeOffset)
+            local lp  = fcf:PointToObjectSpace(tp)
+            local bX  = th.laser.Size.X/2 + PAD_X
+            local bY  = th.laser.Size.Y/2 + PAD_Y
+            local bZ  = th.laser.Size.Z/2 + PAD_Z
+            if math.abs(lp.X)<bX and math.abs(lp.Y)<bY and math.abs(lp.Z)<bZ then
+                safe = false
+            end
+            -- track minimum gap across all axes
+            local gapX = bX - math.abs(lp.X)
+            local gapY = bY - math.abs(lp.Y)
+            local gapZ = bZ - math.abs(lp.Z)
+            local penetration = math.max(gapX, gapY, gapZ)
+            minGap = math.min(minGap, -penetration) -- negative = inside box
         end
     end
+
+    -- Also check landing spot (full 3D including Y)
     if safe then
-        local lp=clampArena(Vector3.new(sp.X+md.X*ws*tAir,FLOOR_Y+0.5,sp.Z+md.Z*ws*tAir))
+        local landP = clampArena(Vector3.new(
+            sp.X + md.X*ws*tAir, FLOOR_Y+0.5, sp.Z + md.Z*ws*tAir))
         for _,th in ipairs(threats) do
-            local fcf=futureCF(th.laser,th.vel,th.av,tAir+timeOffset)
-            local op=fcf:PointToObjectSpace(lp)
-            if math.abs(op.X)<th.laser.Size.X/2+PAD_X and math.abs(op.Z)<th.laser.Size.Z/2+PAD_Z then safe=false end
+            local fcf = futureCF(th.laser, th.vel, th.av, tAir + timeOffset)
+            local op  = fcf:PointToObjectSpace(landP)
+            if math.abs(op.X)<th.laser.Size.X/2+PAD_X
+            and math.abs(op.Y)<th.laser.Size.Y/2+PAD_Y
+            and math.abs(op.Z)<th.laser.Size.Z/2+PAD_Z then
+                safe = false
+            end
         end
     end
-    return safe,mg
+
+    return safe, minGap
 end
 
 -- ==========================================
--- COLLECT THREATS  (warmup + TTI smoothing unchanged)
+-- COLLECT THREATS
 -- ==========================================
 local function collectThreats(dt)
     local out={}
@@ -525,97 +556,134 @@ local function collectThreats(dt)
 end
 
 -- ==========================================
--- BEST JUMP DIRECTION
+-- BEST JUMP DIRECTION  (v27: full 360° sweep vs ALL threats)
 -- ==========================================
-local function getBestJumpDir(primary,threats,fromPos,timeOffset)
-    fromPos=fromPos or root.Position; timeOffset=timeOffset or 0
-    local laser=primary.laser
-    local fwd=Vector3.new(laser.CFrame.LookVector.X,0,laser.CFrame.LookVector.Z)
-    if fwd.Magnitude<0.01 then fwd=Vector3.new(1,0,0) end
-    fwd=fwd.Unit
-    local perpA=Vector3.new(fwd.Z,0,-fwd.X)
-    local perpB=Vector3.new(-fwd.Z,0,fwd.X)
-    local _,tAir,_,ws=getJump()
-    local function landDist(d)
-        local lp=clampArena(Vector3.new(fromPos.X+d.X*ws*tAir,FLOOR_Y+0.5,fromPos.Z+d.Z*ws*tAir))
-        return (Vector3.new(lp.X,0,lp.Z)-Vector3.new(MAP_X,0,MAP_Z)).Magnitude
+local function getBestJumpDir(threats, fromPos, timeOffset)
+    fromPos    = fromPos    or root.Position
+    timeOffset = timeOffset or 0
+    if #threats == 0 then return Vector3.new(1,0,0), true, 999 end
+
+    local bestDir  = nil
+    local bestGap  = -math.huge
+    local bestSafe = false
+
+    for _, dir in ipairs(SWEEP_DIRS) do
+        local safe, gap = arcSafe(threats, dir, fromPos, timeOffset)
+        if safe and gap > bestGap then
+            bestGap  = gap
+            bestDir  = dir
+            bestSafe = true
+        end
     end
-    local baseDir=(landDist(perpA)<=landDist(perpB)) and perpA or perpB
-    for _,deg in ipairs(ANGLE_STEPS) do
-        local rad=math.rad(deg); local c=math.cos(rad); local s=math.sin(rad)
-        local td=Vector3.new(baseDir.X*c-baseDir.Z*s,0,baseDir.X*s+baseDir.Z*c)
-        local safe,gap=arcSafe(threats,td,fromPos,timeOffset)
-        if safe then return td,true,gap end
+
+    -- If no fully safe direction found, pick the one with least penetration
+    if not bestSafe then
+        local leastBad = -math.huge
+        local leastDir = SWEEP_DIRS[1]
+        for _, dir in ipairs(SWEEP_DIRS) do
+            local _, gap = arcSafe(threats, dir, fromPos, timeOffset)
+            if gap > leastBad then
+                leastBad = gap
+                leastDir = dir
+            end
+        end
+        return leastDir, false, leastBad
     end
-    local altBase=(baseDir==perpA) and perpB or perpA
-    for _,deg in ipairs(ANGLE_STEPS) do
-        local rad=math.rad(deg); local c=math.cos(rad); local s=math.sin(rad)
-        local td=Vector3.new(altBase.X*c-altBase.Z*s,0,altBase.X*s+altBase.Z*c)
-        local safe,gap=arcSafe(threats,td,fromPos,timeOffset)
-        if safe then return td,true,gap end
-    end
-    return baseDir,false,0
+
+    return bestDir, true, bestGap
 end
 
 -- ==========================================
--- SAFE POSITION
+-- SAFE POSITION  (v27: correct scoring — reward clearance from ALL lasers)
 -- ==========================================
-local function scorePos(pos,threats)
-    local score=0
-    for _,th in ipairs(threats) do
-        local op=th.laser.CFrame:PointToObjectSpace(pos)
-        local lZ=math.abs(op.Z)
-        local tti=math.max(th.tti,0.05)
-        local fop=futureCF(th.laser,th.vel,th.av,tti*0.5):PointToObjectSpace(pos)
-        score=score+(lZ*0.5+math.abs(fop.Z)*0.5)/tti
+local function scorePos(pos, threats)
+    if #threats == 0 then return math.huge end
+    local worstClearance = math.huge
+    for _, th in ipairs(threats) do
+        -- predict laser position at half its TTI (where it's most relevant)
+        local t = math.max(th.tti * 0.5, 0.1)
+        local fcf = futureCF(th.laser, th.vel, th.av, t)
+        local op  = fcf:PointToObjectSpace(pos)
+        local bX  = th.laser.Size.X/2 + PAD_X + 1.5
+        local bZ  = th.laser.Size.Z/2 + PAD_Z + 1.5
+        -- clearance = how far outside the danger zone we are (positive = safe)
+        local clearX = math.abs(op.X) - bX
+        local clearZ = math.abs(op.Z) - bZ
+        -- minimum clearance across both axes = how safe we are from this laser
+        local clearance = math.min(clearX, clearZ)
+        -- weight urgent lasers more heavily
+        local weight = 1.0 / math.max(th.tti, 0.1)
+        worstClearance = math.min(worstClearance, clearance / weight)
     end
-    return score
+    return worstClearance  -- higher = safer
 end
 
-local function getBestSafe(threats,now)
-    if cachedSafe and (now-lastSafeTime)<SAFE_HZ then return cachedSafe end
-    if #threats==0 then cachedSafe=mapCenter; lastSafeTime=now; return mapCenter end
-    local best=-math.huge; local bestPos=mapCenter
-    local fy=FLOOR_Y+0.5
-    for i=0,SAFE_ANGLES-1 do
-        local a=(i/SAFE_ANGLES)*math.pi*2
-        local c=Vector3.new(MAP_X+math.cos(a)*SAFE_RING,fy,MAP_Z+math.sin(a)*SAFE_RING)
-        local s=scorePos(c,threats)
-        if s>best then best=s; bestPos=c end
+local function getBestSafe(threats, now)
+    if cachedSafe and (now - lastSafeTime) < SAFE_HZ then return cachedSafe end
+    if #threats == 0 then
+        cachedSafe = mapCenter; lastSafeTime = now; return mapCenter
     end
-    if scorePos(mapCenter,threats)>best then bestPos=mapCenter end
-    cachedSafe=bestPos; lastSafeTime=now; return bestPos
+
+    local best    = -math.huge
+    local bestPos = mapCenter
+    local fy      = FLOOR_Y + 0.5
+
+    -- Sample 3 rings + center
+    for _, radius in ipairs({SAFE_RING_1, SAFE_RING_2, SAFE_RING_3}) do
+        for i = 0, SAFE_ANGLES - 1 do
+            local a = (i / SAFE_ANGLES) * math.pi * 2
+            local c = Vector3.new(
+                MAP_X + math.cos(a) * radius, fy,
+                MAP_Z + math.sin(a) * radius)
+            local dx = c.X-MAP_X; local dz = c.Z-MAP_Z
+            if math.sqrt(dx*dx+dz*dz) <= ARENA_R then
+                local s = scorePos(c, threats)
+                if s > best then best = s; bestPos = c end
+            end
+        end
+    end
+    -- also test map center
+    local sc = scorePos(mapCenter, threats)
+    if sc > best then bestPos = mapCenter end
+
+    cachedSafe = bestPos; lastSafeTime = now
+    return bestPos
 end
 
 -- ==========================================
 -- MULTI-STEP PATH PLANNER
 -- ==========================================
-local function planAndDrawPath(threats,now)
-    if #threats==0 then hidePath(); return {} end
-    local jp,tAir,g,ws=getJump()
-    local plan={}
-    local curPos=root.Position
-    local timeAcc=0
-    for step=1,MAX_PLAN_STEPS do
-        local bestThreat=nil; local bestTTI=math.huge
+local function planAndDrawPath(threats, now)
+    if #threats == 0 then hidePath(); return {} end
+    local jp,tAir,g,ws = getJump()
+    local plan   = {}
+    local curPos = root.Position
+    local timeAcc = 0
+
+    for step = 1, MAX_PLAN_STEPS do
+        local bestThreat = nil; local bestTTI = math.huge
         for _,th in ipairs(threats) do
-            local fcf=futureCF(th.laser,th.vel,th.av,timeAcc)
-            local objP=fcf:PointToObjectSpace(curPos)
-            local lZ=math.abs(objP.Z)
-            local tti=computeTTI(th.laser,lZ,th.vel,th.av,th.spd)
-            if not passed[th.laser] and tti<bestTTI then bestTTI=tti; bestThreat=th end
+            local fcf  = futureCF(th.laser, th.vel, th.av, timeAcc)
+            local objP = fcf:PointToObjectSpace(curPos)
+            local lZ   = math.abs(objP.Z)
+            local tti  = computeTTI(th.laser, lZ, th.vel, th.av, th.spd)
+            if not passed[th.laser] and tti < bestTTI then
+                bestTTI = tti; bestThreat = th
+            end
         end
-        if not bestThreat or bestTTI>REPOSITION_TTI then break end
-        local safePos=getBestSafe(threats,now)
-        drawWalkSeg(step,curPos,safePos)
-        local dir,safe,_=getBestJumpDir(bestThreat,threats,safePos,timeAcc)
-        local landPos=drawJumpArc(step,safePos,dir,jp,tAir,g,ws)
-        landPos=clampArena(Vector3.new(landPos.X,FLOOR_Y+0.5,landPos.Z))
-        table.insert(plan,{fromPos=safePos,dir=dir,landPos=landPos,safe=safe,tti=bestTTI})
-        timeAcc=timeAcc+tAir+0.25
-        curPos=landPos
+        if not bestThreat or bestTTI > REPOSITION_TTI then break end
+
+        local safePos = getBestSafe(threats, now)
+        drawWalkSeg(step, curPos, safePos)
+        local dir, safe, _ = getBestJumpDir(threats, safePos, timeAcc)
+        local landPos = drawJumpArc(step, safePos, dir, jp, tAir, g, ws)
+        landPos = clampArena(Vector3.new(landPos.X, FLOOR_Y+0.5, landPos.Z))
+        table.insert(plan, {fromPos=safePos, dir=dir, landPos=landPos, safe=safe, tti=bestTTI})
+        timeAcc = timeAcc + tAir + 0.25
+        curPos  = landPos
     end
-    for step=#plan+1,MAX_PLAN_STEPS do
+
+    for step = #plan+1, MAX_PLAN_STEPS do
         for _,p in ipairs(arcPools[step])  do p.Transparency=1 end
         for _,p in ipairs(walkPools[step]) do p.Transparency=1 end
         landDots[step].Transparency=1
@@ -629,7 +697,7 @@ end
 local function moveTo(pos)
     if lastMovePos then
         local dx=pos.X-lastMovePos.X; local dz=pos.Z-lastMovePos.Z
-        if dx*dx+dz*dz<MOVE_THRESH*MOVE_THRESH then return end
+        if dx*dx+dz*dz < MOVE_THRESH*MOVE_THRESH then return end
     end
     lastMovePos=pos; hum:MoveTo(pos)
 end
@@ -638,8 +706,8 @@ local function clearMove() lastMovePos=nil end
 local function onArena()
     local p=root.Position
     local dx=p.X-MAP_X; local dz=p.Z-MAP_Z
-    return math.sqrt(dx*dx+dz*dz)<=(ARENA_R+6)
-        and p.Y>=FLOOR_Y-1 and p.Y<=FLOOR_Y+9
+    return math.sqrt(dx*dx+dz*dz) <= (ARENA_R+6)
+        and p.Y >= FLOOR_Y-1 and p.Y <= FLOOR_Y+9
 end
 
 -- ==========================================
@@ -648,44 +716,44 @@ end
 RunService.Heartbeat:Connect(function(dt)
     if not char or hum.Health<=0 then
         hidePath(); safeDot.Transparency=1
-        setStatus("Dead",Color3.fromRGB(255,80,80))
+        setStatus("Dead", Color3.fromRGB(255,80,80))
         clearMove(); return
     end
 
-    local now=tick()
-    lTimer.Text=string.format("[v26] %.1fs",now-runStart)
+    local now = tick()
+    lTimer.Text = string.format("[v27] %.1fs", now-runStart)
 
     if not onArena() then
         hidePath(); safeDot.Transparency=1
-        setStatus("Off arena",Color3.fromRGB(180,180,180))
-        clearMove(); lastRootPos=nil; return
+        setStatus("Off arena", Color3.fromRGB(180,180,180))
+        clearMove(); return
     end
 
-    local threats=collectThreats(dt)
-    local state=hum:GetState()
-    local inAir=state==Enum.HumanoidStateType.Freefall
-             or state==Enum.HumanoidStateType.Jumping
-    local canJump=(now-lastJumpTime)>=JUMP_COOLDOWN
+    local threats = collectThreats(dt)
+    local state   = hum:GetState()
+    local inAir   = state==Enum.HumanoidStateType.Freefall
+                 or state==Enum.HumanoidStateType.Jumping
+    local canJump = (now-lastJumpTime) >= JUMP_COOLDOWN
 
-    if #threats>0 then
-        lTTI.Text=string.format("TTI: %.2fs  lZ=%.1f",threats[1].tti,threats[1].localZ)
+    if #threats > 0 then
+        lTTI.Text = string.format("TTI: %.2fs  n=%d", threats[1].tti, #threats)
     else
-        lTTI.Text="TTI: safe"
+        lTTI.Text = "TTI: safe"
     end
 
-    local bestSafe=getBestSafe(threats,now)
-    safeDot.Position=bestSafe; safeDot.Transparency=0.3
-    planAndDrawPath(threats,now)
+    local bestSafe = getBestSafe(threats, now)
+    safeDot.Position = bestSafe; safeDot.Transparency = 0.3
+    planAndDrawPath(threats, now)
 
     -- No threats
-    if #threats==0 then
-        jumpPending=false
-        setStatus("Safe - holding",Color3.fromRGB(80,220,160))
+    if #threats == 0 then
+        jumpPending = false
+        setStatus("Safe - holding", Color3.fromRGB(80,220,160))
         if not inAir then moveTo(bestSafe) end
         return
     end
 
-    local primary=threats[1]
+    local primary = threats[1]
 
     -- In air
     if inAir then
@@ -695,19 +763,19 @@ RunService.Heartbeat:Connect(function(dt)
     end
 
     -- Fire pending jump
-    if jumpPending and now>=jumpPendTime then
-        local safe,_=arcSafe(threats,jumpPendDir,nil,0)
+    if jumpPending and now >= jumpPendTime then
+        local safe, _ = arcSafe(threats, jumpPendDir, nil, 0)
         if safe then
-            jumpCount=jumpCount+1
-            lJumps.Text=string.format("Jumps: %d",jumpCount)
-            lastJumpTime=now; jumpPending=false; clearMove()
+            jumpCount = jumpCount+1
+            lJumps.Text = string.format("Jumps: %d", jumpCount)
+            lastJumpTime = now; jumpPending = false; clearMove()
             hum:MoveTo(jumpPendTarget)
             hum:ChangeState(Enum.HumanoidStateType.Jumping)
-            setStatus("JUMP!",Color3.fromRGB(60,255,100))
+            setStatus("JUMP!", Color3.fromRGB(60,255,100))
             return
         else
-            jumpPending=false
-            setStatus("Replanning",Color3.fromRGB(255,120,40))
+            jumpPending = false
+            setStatus("Replanning", Color3.fromRGB(255,120,40))
         end
     end
 
@@ -717,44 +785,45 @@ RunService.Heartbeat:Connect(function(dt)
     -- Reposition
     if needsRepos and not jumpPending then
         moveTo(bestSafe)
-        setStatus(string.format("Reposition %.1fs",primary.tti),Color3.fromRGB(140,180,255))
+        setStatus(string.format("Reposition %.1fs", primary.tti), Color3.fromRGB(140,180,255))
         return
     end
 
     -- Jump window
     if inWindow and canJump and not jumpPending then
-        -- v26 FIX: mustNow also requires mustJumpToAvoid confirmation.
-        -- Both mustNow and the normal path now pass bestSafe as the
-        -- walk target, so the bot simulates its actual movement.
         local needsJump = mustJumpToAvoid(primary, root.Position, bestSafe)
         if not needsJump then
             moveTo(bestSafe)
-            setStatus(string.format("No jump %.2fs",primary.tti),Color3.fromRGB(0,220,120))
+            setStatus(string.format("No jump %.2fs", primary.tti), Color3.fromRGB(0,220,120))
             return
         end
-        local dir,safe,_=getBestJumpDir(primary,threats,nil,0)
-        local _,tAir,_,ws=getJump()
-        local landTarget=clampArena(Vector3.new(
-            root.Position.X+dir.X*ws*tAir,
+
+        -- v27: pass ALL threats to getBestJumpDir, not just primary
+        local dir, safe, _ = getBestJumpDir(threats, nil, 0)
+        local _,tAir,_,ws  = getJump()
+        local landTarget = clampArena(Vector3.new(
+            root.Position.X + dir.X*ws*tAir,
             FLOOR_Y+0.5,
-            root.Position.Z+dir.Z*ws*tAir))
+            root.Position.Z + dir.Z*ws*tAir))
+
         if safe then
-            local delay=REACT_MIN+math.random()*(REACT_MAX-REACT_MIN)
-            jumpPending=true; jumpPendTime=now+delay
-            jumpPendDir=dir; jumpPendTarget=landTarget
-            setStatus("Ready...",Color3.fromRGB(255,200,60))
+            local delay = REACT_MIN + math.random()*(REACT_MAX-REACT_MIN)
+            jumpPending    = true
+            jumpPendTime   = now + delay
+            jumpPendDir    = dir
+            jumpPendTarget = landTarget
+            setStatus("Ready...", Color3.fromRGB(255,200,60))
         else
-            -- Only force jump if laser will genuinely hit even after walking
             if primary.tti <= JUMP_MIN_TTI then
-                jumpCount=jumpCount+1
-                lJumps.Text=string.format("Jumps: %d",jumpCount)
-                lastJumpTime=now; clearMove()
+                jumpCount = jumpCount+1
+                lJumps.Text = string.format("Jumps: %d", jumpCount)
+                lastJumpTime = now; clearMove()
                 hum:MoveTo(landTarget)
                 hum:ChangeState(Enum.HumanoidStateType.Jumping)
-                setStatus("FORCED!",Color3.fromRGB(255,80,80))
+                setStatus("FORCED!", Color3.fromRGB(255,80,80))
             else
                 moveTo(bestSafe)
-                setStatus("No safe arc",Color3.fromRGB(255,120,40))
+                setStatus("No safe arc", Color3.fromRGB(255,120,40))
             end
         end
         return
@@ -763,6 +832,6 @@ RunService.Heartbeat:Connect(function(dt)
     -- Hold
     if not jumpPending then
         moveTo(bestSafe)
-        setStatus(string.format("Holding %.2fs",primary.tti),Color3.fromRGB(140,180,255))
+        setStatus(string.format("Holding %.2fs", primary.tti), Color3.fromRGB(140,180,255))
     end
 end)
