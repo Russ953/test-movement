@@ -1,1046 +1,665 @@
 -- ==========================================
--- MOVEMENT SCRIPT v21
+-- MOVEMENT SCRIPT v22
 -- ==========================================
--- CHANGES FROM v20:
+-- CORE PHILOSOPHY:
+--   The bot does ONE thing: stand at the safest
+--   spot, wait calmly, then at the perfect moment
+--   jump STRAIGHT OVER the laser (perpendicular).
+--   It never runs away from lasers.
 --
--- 1. FULL PATH VISUALIZER (new):
---    - Recalculates EVERY Heartbeat frame
---    - Shows 5 future walk+jump cycles
---    - Walk segments: cyan dots + connector lines
---    - Jump arcs: green/orange/red arc dots
---    - Landing spheres: yellow (safe) / red (unsafe)
---    - Total lookahead: ~25-30 studs ahead
---
--- 2. BUG FIX - CONFIRM_TTI_LOOKAHEAD:
---    - Only applied when localZ > 5
---    - Was silently dropping close-range threats
---    - Bot now correctly triggers jumps at short range
---
--- 3. BUG FIX - angVelY=0 first frame:
---    - laserSweepingToward now returns true when
---      angVelY is near zero (safe default assumption)
---
--- 4. BUG FIX - smartMoveTo threshold:
---    - Lowered from 1.5 to 0.4 studs
---    - Bot no longer freezes mid-approach
---
--- 5. BUG FIX - airdash early return:
---    - No longer returns early when no dash found
---    - Falls through to normal air steering instead
---
--- 6. BUG FIX - safe pos cache invalidation:
---    - Cache invalidated when threat count changes
---    - Prevents bot walking into newly spawned laser
---
--- 7. TUNING:
---    - JUMP_TRIGGER_DISTANCE: 4.0 -> 5.5
---    - FAST_TTI: 0.55 -> 0.65
---    - OUTER_BONUS_THRESH: 3.0 -> 5.0
---    - SCORE_ANGLES: 24 -> 36
---    - CONFIRM_TTI_LOOKAHEAD: 0.3 -> 0.15
+-- CHANGES FROM v21:
+--   1. Jump direction is now ALWAYS perpendicular
+--      to the laser (straight over it), not toward
+--      a far side point along the laser's length.
+--   2. Bot now waits at safe position until the
+--      laser is close enough, then jumps.
+--      No more constant movement / running away.
+--   3. Jump timing uses precise TTI window:
+--      jump when TTI is between JUMP_MIN_TTI and
+--      JUMP_MAX_TTI - the sweet spot to clear it.
+--   4. Landing safety check: after computing perp
+--      direction, scan all OTHER lasers too.
+--      If landing is unsafe, try perpendicular+slight
+--      angle adjustment (±15°, ±30°) to find clear.
+--   5. Removed airdash and crossing logic -
+--      replaced with cleaner in-air steering.
+--   6. Human-feel: added small random reaction
+--      delay (0.05-0.12s) before each jump.
+--   7. Safe pos: bot only repositions when current
+--      pos becomes threatened (TTI < REPOSITION_TTI).
+--   8. Path visualizer kept but simplified to show
+--      only the planned jump arc.
 -- ==========================================
-print("[Movement] v21 loaded")
+print("[Movement] v22 loaded")
 
 local Players    = game:GetService("Players")
 local RunService = game:GetService("RunService")
 
 local player    = Players.LocalPlayer
-local character = player.Character or player.CharacterAdded:Wait()
-local humanoid  = character:WaitForChild("Humanoid")
-local rootPart  = character:WaitForChild("HumanoidRootPart")
+local char      = player.Character or player.CharacterAdded:Wait()
+local hum       = char:WaitForChild("Humanoid")
+local root      = char:WaitForChild("HumanoidRootPart")
 
-local mapPart      = workspace:WaitForChild("Laser Game Map"):WaitForChild("Cylinder.005")
 local lasersFolder = workspace:WaitForChild("Lasers"):WaitForChild("ActiveLasers")
 
--- ---- Hardcoded arena constants ----
-local MAP_CENTER_X  = -178.238647
-local MAP_CENTER_Y  =   40.161911
-local MAP_CENTER_Z  =   12.4262772
-local ARENA_FLOOR_Y = MAP_CENTER_Y + (2.381 / 2)
-local ARENA_PLAY_RADIUS = 33.0
-
-local mapCenter  = Vector3.new(MAP_CENTER_X, ARENA_FLOOR_Y + 0.5, MAP_CENTER_Z)
-local safeRadius = ARENA_PLAY_RADIUS
-
-local ARENA_XZ_RADIUS = ARENA_PLAY_RADIUS + 6
-local ARENA_Y_MARGIN  = 8
-
--- ---- Safe zone scoring ----
-local SCORE_ANGLES       = 36      -- FIX v21: was 24
-local INNER_RADIUS       = 12
-local OUTER_RADIUS       = 28
-local OUTER_BONUS_THRESH = 5.0    -- FIX v21: was 3.0
-local SCORE_UPDATE_RATE  = 0.12
-
--- ---- Jump / TTI tuning ----
-local JUMP_TRIGGER_DISTANCE = 5.5  -- FIX v21: was 4.0
-local APPROACH_START        = 14
-local AGGRO_DISTANCE        = 60
-local VIZ_RANGE             = 80
-local JUMP_COOLDOWN         = 0.35
-local PASS_CONFIRM_DIST     = 8
-local LASER_MOVE_THRESHOLD  = 0.4
-local RESET_WORLD_DIST      = 120
-local TIGHT_CLEARANCE       = 1.8
-local FAST_TTI              = 0.65  -- FIX v21: was 0.55
-local AIRDASH_COOLDOWN      = 0.6
-local AIRDASH_CHECK_START   = 0.15
-local FAR_SIDE_DIST         = 20
-local MIN_CROSS_AHEAD       = 4
-local CONFIRM_TTI_LOOKAHEAD = 0.15  -- FIX v21: was 0.3
-
--- Hit-box paddings
-local PAD_X = 0.6
-local PAD_Y = 2.6
-local PAD_Z = 0.9
-
--- Crossing
-local MAX_CROSS_DIST  = 14
-local CROSS_BOTH_DIST = 18
-local CROSS_OVERSHOOT = 5
-
--- Planner
-local PLAN_INTERVAL   = 0.4
-local PLAN_STEPS      = 3
-local PLAN_CANDIDATES = 8
-
--- ---- Path Viz config ----
-local PATH_STEPS       = 5     -- future walk+jump cycles
-local WALK_SIM_DIST    = 22    -- studs of walk per segment
-local WALK_DOT_COUNT   = 14    -- dots per walk segment
-local ARC_DOT_COUNT    = 20    -- dots per jump arc
-local WALK_DOT_SIZE    = 0.28
-local ARC_DOT_SIZE     = 0.38
-local LAND_SPHERE_SIZE = 0.9
-
-local COLOR_WALK_SAFE   = Color3.fromRGB(0,   210, 255)
-local COLOR_WALK_DANGER = Color3.fromRGB(255,  60,  60)
-local COLOR_ARC_SAFE    = Color3.fromRGB(60,  220, 100)
-local COLOR_ARC_TIGHT   = Color3.fromRGB(255, 160,  30)
-local COLOR_ARC_UNSAFE  = Color3.fromRGB(255,  50,  50)
-local COLOR_LAND_SAFE   = Color3.fromRGB(255, 220,  30)
-local COLOR_LAND_UNSAFE = Color3.fromRGB(255,  60,  60)
-
--- ---- State ----
-local lastLaserCFrames = setmetatable({}, {__mode="k"})
-local lastLaserAngVel  = setmetatable({}, {__mode="k"})
-local lastLaserSide    = setmetatable({}, {__mode="k"})
-local laserPassedFlag  = setmetatable({}, {__mode="k"})
-local lastJumpTime     = 0
-local jumpCount        = 0
-local runStart         = tick()
-local lastRootPos      = nil
-local lastDebugPrint   = 0
-local DEBUG_INTERVAL   = 0.5
-
-local jumpStartTime   = 0
-local lastAirdashTime = -999
-local didAirdash      = false
-
-local lastPlanTime = 0
-local currentPlan  = nil
-
-local lastMoveTarget     = nil
-local MOVE_RETARGET_DIST = 0.4  -- FIX v21: was 1.5
-
--- Safe pos cache
-local lastSafePosTime  = 0
-local cachedSafePos    = nil
-local lastThreatCount  = -1  -- FIX v21: cache invalidation
+-- ==========================================
+-- ARENA CONSTANTS  (edit to match your map)
+-- ==========================================
+local MAP_X = -178.238647
+local MAP_Y =   40.161911
+local MAP_Z =   12.4262772
+local FLOOR_Y     = MAP_Y + (2.381 / 2)
+local ARENA_R     = 33.0
+local mapCenter   = Vector3.new(MAP_X, FLOOR_Y + 0.5, MAP_Z)
 
 -- ==========================================
--- MOVEMENT HELPERS
+-- TUNING
 -- ==========================================
-local function smartMoveTo(pos)
-    if lastMoveTarget then
-        local dx = pos.X - lastMoveTarget.X
-        local dz = pos.Z - lastMoveTarget.Z
-        if dx*dx + dz*dz < MOVE_RETARGET_DIST*MOVE_RETARGET_DIST then return end
-    end
-    lastMoveTarget = pos
-    humanoid:MoveTo(pos)
-end
+-- Jump timing window (seconds until laser hits)
+local JUMP_MAX_TTI   = 0.80   -- start considering jump
+local JUMP_MIN_TTI   = 0.20   -- must jump by now
+local JUMP_COOLDOWN  = 0.40   -- min gap between jumps
 
-local function clearMoveTarget()
-    lastMoveTarget = nil
-end
+-- How much to overshoot past the laser center
+local JUMP_OVERSHOOT = 8.0    -- studs past laser center
+
+-- Angle search when straight perp is unsafe
+local ANGLE_STEPS    = {0, 15, -15, 30, -30, 45, -45}
+
+-- Reposition: if closest threat TTI < this, find new safe spot
+local REPOSITION_TTI   = 3.5
+local SAFE_RADIUS_RING = 16    -- preferred orbit ring
+local SAFE_SCORE_ANGLES = 48
+local SAFE_UPDATE_HZ    = 0.15  -- seconds between safe pos recalculations
+
+-- Human-feel
+local REACT_DELAY_MIN = 0.05
+local REACT_DELAY_MAX = 0.12
+
+-- Hitbox padding for arc check
+local PAD_X = 0.7
+local PAD_Y = 2.8
+local PAD_Z = 1.0
+
+-- Passed detection
+local PASS_DIST      = 7.0
+local PASS_VEL_DOT   = -0.25
+local AGGRO_DIST     = 65
+local LASER_MIN_SPD  = 0.3
+local WORLD_RESET    = 130
+
+-- Viz
+local ARC_DOTS     = 24
+local ARC_DOT_SIZE = 0.40
+
+-- ==========================================
+-- STATE
+-- ==========================================
+local lastCF    = setmetatable({}, {__mode="k"})
+local lastSide  = setmetatable({}, {__mode="k"})
+local passed    = setmetatable({}, {__mode="k"})
+
+local lastJumpTime  = 0
+local jumpCount     = 0
+local runStart      = tick()
+
+local jumpPending       = false
+local jumpPendingTime   = 0   -- when to actually fire the jump (after react delay)
+local jumpPendingDir    = Vector3.new(1,0,0)
+local jumpPendingTarget = Vector3.new(0,0,0)
+
+local lastSafeTime  = 0
+local cachedSafe    = nil
+local lastMovePos   = nil
+local MOVE_THRESH   = 0.5
+
+local lastRootPos   = nil
+local realMoveDir   = Vector3.zero
 
 -- ==========================================
 -- HUD
 -- ==========================================
-local screenGui = Instance.new("ScreenGui")
-screenGui.Name           = "MovementHUD"
-screenGui.ResetOnSpawn   = false
-screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-screenGui.Parent         = player.PlayerGui
+local sg = Instance.new("ScreenGui")
+sg.Name="MovementHUDv22"; sg.ResetOnSpawn=false
+sg.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
+sg.Parent=player.PlayerGui
 
-local hudFrame = Instance.new("Frame")
-hudFrame.Size                   = UDim2.new(0, 240, 0, 116)
-hudFrame.Position               = UDim2.new(1, -250, 0, 10)
-hudFrame.BackgroundColor3       = Color3.fromRGB(12,12,12)
-hudFrame.BackgroundTransparency = 0.3
-hudFrame.BorderSizePixel        = 0
-hudFrame.Parent                 = screenGui
-Instance.new("UICorner", hudFrame).CornerRadius = UDim.new(0,8)
+local frame = Instance.new("Frame")
+frame.Size=UDim2.new(0,230,0,100)
+frame.Position=UDim2.new(1,-242,0,10)
+frame.BackgroundColor3=Color3.fromRGB(8,8,8)
+frame.BackgroundTransparency=0.25
+frame.BorderSizePixel=0
+frame.Parent=sg
+Instance.new("UICorner",frame).CornerRadius=UDim.new(0,8)
 
-local function makeLabel(yoff, col, size, bold)
-    local l = Instance.new("TextLabel")
-    l.Size            = UDim2.new(1,-10, 0, 20)
-    l.Position        = UDim2.new(0,8, 0, yoff)
-    l.BackgroundTransparency = 1
-    l.TextColor3      = col
-    l.Font            = bold and Enum.Font.GothamBold or Enum.Font.Gotham
-    l.TextSize        = size
-    l.TextXAlignment  = Enum.TextXAlignment.Left
-    l.Parent          = hudFrame
-    return l
+local function lbl(y,col,sz,bold)
+    local l=Instance.new("TextLabel")
+    l.Size=UDim2.new(1,-10,0,20); l.Position=UDim2.new(0,8,0,y)
+    l.BackgroundTransparency=1; l.TextColor3=col
+    l.Font=bold and Enum.Font.GothamBold or Enum.Font.Gotham
+    l.TextSize=sz; l.TextXAlignment=Enum.TextXAlignment.Left
+    l.Parent=frame; return l
 end
+local lTimer  = lbl(4,  Color3.fromRGB(80,220,160),17,true)
+local lJumps  = lbl(26, Color3.fromRGB(255,200,60),15,true)
+local lStatus = lbl(50, Color3.fromRGB(200,200,200),13,false)
+local lTTI    = lbl(70, Color3.fromRGB(120,200,255),12,false)
 
-local timerLabel = makeLabel(4,  Color3.fromRGB(80,220,160),  17, true)
-local jumpLabel  = makeLabel(26, Color3.fromRGB(255,200,60),  15, true)
-local crossLabel = makeLabel(48, Color3.fromRGB(120,200,255), 13, false)
-local dashLabel  = makeLabel(68, Color3.fromRGB(255,140,200), 13, false)
-local safeLabel  = makeLabel(88, Color3.fromRGB(180,255,180), 12, false)
+lTimer.Text="[v22] 0.0s"
+lJumps.Text="Jumps: 0"
+lStatus.Text="Waiting..."
+lTTI.Text="TTI: -"
 
-timerLabel.Text = "\xe2\x8f\xb1  0.0s"
-jumpLabel.Text  = "\xf0\x9f\xa6\x98 Jumps: 0"
-crossLabel.Text = "\xe2\x9c\x96 No crossing"
-dashLabel.Text  = "\xe2\x9a\xa1 Dash: ready"
-safeLabel.Text  = "\xf0\x9f\x9f\xa2 Safe pos: center"
-
-local statusLabel = Instance.new("TextLabel")
-statusLabel.Size                   = UDim2.new(0,240, 0,22)
-statusLabel.Position               = UDim2.new(1,-250, 0,130)
-statusLabel.BackgroundColor3       = Color3.fromRGB(12,12,12)
-statusLabel.BackgroundTransparency = 0.3
-statusLabel.BorderSizePixel        = 0
-statusLabel.TextColor3             = Color3.fromRGB(200,200,200)
-statusLabel.Font                   = Enum.Font.Gotham
-statusLabel.TextSize               = 13
-statusLabel.TextXAlignment         = Enum.TextXAlignment.Center
-statusLabel.Text                   = "\xe2\x97\x89 Waiting\xe2\x80\xa6"
-statusLabel.Parent                 = screenGui
-Instance.new("UICorner", statusLabel).CornerRadius = UDim.new(0,8)
-
-local function setStatus(txt, col)
-    statusLabel.Text       = txt
-    statusLabel.TextColor3 = col or Color3.fromRGB(200,200,200)
+local function setStatus(txt,col)
+    lStatus.Text=txt
+    lStatus.TextColor3=col or Color3.fromRGB(200,200,200)
 end
 
 -- ==========================================
--- VIZ FOLDER SETUP
+-- VIZ
 -- ==========================================
-local vizRoot = workspace:FindFirstChild("PathVizV21")
-if vizRoot then vizRoot:Destroy() end
-vizRoot = Instance.new("Folder")
-vizRoot.Name   = "PathVizV21"
-vizRoot.Parent = workspace
+local vizFolder = workspace:FindFirstChild("PathVizV22")
+if vizFolder then vizFolder:Destroy() end
+vizFolder = Instance.new("Folder")
+vizFolder.Name="PathVizV22"; vizFolder.Parent=workspace
 
-local function makePool(count, size, shape)
-    local pool = {}
-    for i = 1, count do
-        local p = Instance.new("Part")
-        p.Size       = Vector3.new(size,size,size)
-        p.Anchored   = true
-        p.CanCollide = false
-        p.CastShadow = false
-        p.Material   = Enum.Material.Neon
-        p.Shape      = shape or Enum.PartType.Ball
-        p.Transparency = 1
-        p.Parent     = vizRoot
-        pool[i]      = p
+local arcDotPool = {}
+for i=1,ARC_DOTS do
+    local p=Instance.new("Part")
+    p.Size=Vector3.new(ARC_DOT_SIZE,ARC_DOT_SIZE,ARC_DOT_SIZE)
+    p.Anchored=true; p.CanCollide=false; p.CastShadow=false
+    p.Material=Enum.Material.Neon; p.Shape=Enum.PartType.Ball
+    p.Transparency=1; p.Parent=vizFolder
+    arcDotPool[i]=p
+end
+
+local safeDot = Instance.new("Part")
+safeDot.Size=Vector3.new(1.2,1.2,1.2); safeDot.Anchored=true
+safeDot.CanCollide=false; safeDot.CastShadow=false
+safeDot.Material=Enum.Material.Neon; safeDot.Shape=Enum.PartType.Ball
+safeDot.Color=Color3.fromRGB(0,255,120); safeDot.Transparency=1
+safeDot.Parent=vizFolder
+
+local landDot = Instance.new("Part")
+landDot.Size=Vector3.new(1.4,1.4,1.4); landDot.Anchored=true
+landDot.CanCollide=false; landDot.CastShadow=false
+landDot.Material=Enum.Material.Neon; landDot.Shape=Enum.PartType.Ball
+landDot.Color=Color3.fromRGB(255,220,30); landDot.Transparency=1
+landDot.Parent=vizFolder
+
+local function drawArc(startPos, dir, safe)
+    local g  = workspace.Gravity
+    local jp = hum.UseJumpPower and hum.JumpPower or math.sqrt(2*g*hum.JumpHeight)
+    local ws = hum.WalkSpeed
+    local tAir = (2*jp)/g
+    local ts   = tAir/ARC_DOTS
+    local col  = safe and Color3.fromRGB(60,220,100) or Color3.fromRGB(255,60,60)
+    for i=1,ARC_DOTS do
+        local t   = i*ts
+        local pos = Vector3.new(
+            startPos.X + dir.X*ws*t,
+            startPos.Y + jp*t - 0.5*g*t*t,
+            startPos.Z + dir.Z*ws*t
+        )
+        arcDotPool[i].Position=pos; arcDotPool[i].Color=col
+        arcDotPool[i].Transparency=0.15
     end
-    return pool
+    -- landing sphere
+    local lp = Vector3.new(startPos.X+dir.X*ws*tAir, FLOOR_Y+0.5, startPos.Z+dir.Z*ws*tAir)
+    landDot.Position=lp; landDot.Transparency=0.15
+    landDot.Color=safe and Color3.fromRGB(255,220,30) or Color3.fromRGB(255,60,60)
 end
 
-local function makeCylPool(count)
-    local pool = {}
-    for i = 1, count do
-        local p = Instance.new("Part")
-        p.Anchored   = true; p.CanCollide=false; p.CastShadow=false
-        p.Material   = Enum.Material.Neon
-        p.Shape      = Enum.PartType.Cylinder
-        p.Transparency = 1; p.Parent=vizRoot
-        pool[i]      = p
-    end
-    return pool
-end
-
--- Build per-step pools
-local stepPools = {}
-for s = 1, PATH_STEPS do
-    local landSphere = Instance.new("Part")
-    landSphere.Size=Vector3.new(LAND_SPHERE_SIZE,LAND_SPHERE_SIZE,LAND_SPHERE_SIZE)
-    landSphere.Anchored=true; landSphere.CanCollide=false; landSphere.CastShadow=false
-    landSphere.Material=Enum.Material.Neon; landSphere.Shape=Enum.PartType.Ball
-    landSphere.Transparency=1; landSphere.Parent=vizRoot
-
-    stepPools[s] = {
-        walkDots   = makePool(WALK_DOT_COUNT, WALK_DOT_SIZE),
-        walkConns  = makeCylPool(WALK_DOT_COUNT),
-        arcDots    = makePool(ARC_DOT_COUNT, ARC_DOT_SIZE),
-        landSphere = landSphere,
-    }
-end
-
--- Safe pos marker
-local safePosMarker = Instance.new("Part")
-safePosMarker.Size=Vector3.new(1.4,1.4,1.4); safePosMarker.Anchored=true
-safePosMarker.CanCollide=false; safePosMarker.CastShadow=false
-safePosMarker.Material=Enum.Material.Neon; safePosMarker.Shape=Enum.PartType.Ball
-safePosMarker.Color=Color3.fromRGB(0,255,120); safePosMarker.Transparency=1
-safePosMarker.Parent=vizRoot
-
-local crossMarker = Instance.new("Part")
-crossMarker.Size=Vector3.new(1.5,1.5,1.5); crossMarker.Anchored=true
-crossMarker.CanCollide=false; crossMarker.CastShadow=false
-crossMarker.Material=Enum.Material.Neon; crossMarker.Shape=Enum.PartType.Ball
-crossMarker.Color=Color3.fromRGB(0,220,255); crossMarker.Transparency=1
-crossMarker.Parent=vizRoot
-
--- ==========================================
--- VIZ HELPERS
--- ==========================================
-local function hideAllViz()
-    for s = 1, PATH_STEPS do
-        local pool = stepPools[s]
-        for _, p in ipairs(pool.walkDots)  do p.Transparency=1 end
-        for _, p in ipairs(pool.walkConns) do p.Transparency=1 end
-        for _, p in ipairs(pool.arcDots)   do p.Transparency=1 end
-        pool.landSphere.Transparency=1
-    end
-    safePosMarker.Transparency=1
-    crossMarker.Transparency=1
-end
-
-local function drawConn(part, a, b, color, alpha)
-    local diff = b - a
-    local len  = diff.Magnitude
-    if len < 0.05 then part.Transparency=1; return end
-    part.Size        = Vector3.new(0.12, 0.12, len)
-    part.CFrame      = CFrame.lookAt((a+b)*0.5, b)
-    part.Color       = color
-    part.Transparency = alpha or 0.45
+local function hideArc()
+    for _,p in ipairs(arcDotPool) do p.Transparency=1 end
+    landDot.Transparency=1
 end
 
 -- ==========================================
--- ARENA CHECK
+-- PHYSICS HELPERS
 -- ==========================================
-local function checkOnArena()
-    local pos = rootPart.Position
-    local dx  = pos.X - MAP_CENTER_X
-    local dz  = pos.Z - MAP_CENTER_Z
-    return math.sqrt(dx*dx+dz*dz) <= ARENA_XZ_RADIUS
-        and pos.Y >= ARENA_FLOOR_Y - 1
-        and pos.Y <= ARENA_FLOOR_Y + ARENA_Y_MARGIN
+local function getJump()
+    local g  = workspace.Gravity
+    local jp = hum.UseJumpPower and hum.JumpPower or math.sqrt(2*g*hum.JumpHeight)
+    return jp, (2*jp)/g, g, hum.WalkSpeed
 end
 
--- ==========================================
--- LASER PHYSICS
--- ==========================================
-local function getLaserMotion(item, oldCF, dt)
-    if not oldCF then return Vector3.zero, 0 end
-    local transVel = (item.Position - oldCF.Position) / dt
-    local oldFwd = Vector3.new(oldCF.LookVector.X, 0, oldCF.LookVector.Z)
-    local newFwd = Vector3.new(item.CFrame.LookVector.X, 0, item.CFrame.LookVector.Z)
-    local angVelY = 0
-    if oldFwd.Magnitude>0.01 and newFwd.Magnitude>0.01 then
-        local cross = oldFwd:Cross(newFwd)
-        angVelY = cross.Y / dt
-    end
-    local halfLen = item.Size.Z / 2
-    local perpDir = Vector3.new(newFwd.Z, 0, -newFwd.X) * math.sign(angVelY + 1e-9)
-    local tipVel  = transVel + perpDir * math.abs(angVelY) * halfLen
-    return tipVel, angVelY
-end
-
-local function futureLaserCF(laser, vel, angVelY, t)
-    local futurePos   = laser.Position + vel * t
-    local baseAngle   = math.atan2(laser.CFrame.LookVector.X, laser.CFrame.LookVector.Z)
-    local futureAngle = baseAngle + angVelY * t
-    return CFrame.new(futurePos) * CFrame.Angles(0, futureAngle, 0)
-end
-
--- ==========================================
--- SAFE ZONE SCORING
--- ==========================================
-local function scorePosition(pos, threats)
-    local score = 0
-    for _, t in ipairs(threats) do
-        local laser   = t.laser
-        local vel     = t.velocity
-        local angVelY = t.angVelY
-        local tti     = math.max(t.tti, 0.05)
-        local weight  = 1 / tti
-
-        local objPos  = laser.CFrame:PointToObjectSpace(pos)
-        local distZ   = math.abs(objPos.Z)
-
-        local halfT   = tti * 0.5
-        local fcf     = futureLaserCF(laser, vel, angVelY, halfT)
-        local fop     = fcf:PointToObjectSpace(pos)
-        local fDistZ  = math.abs(fop.Z)
-
-        local laserFwd = Vector3.new(laser.CFrame.LookVector.X, 0, laser.CFrame.LookVector.Z)
-        local toPos    = Vector3.new(pos.X - laser.Position.X, 0, pos.Z - laser.Position.Z)
-        local angSep   = 0
-        if laserFwd.Magnitude>0.01 and toPos.Magnitude>0.01 then
-            local dot = math.clamp(laserFwd.Unit:Dot(toPos.Unit), -1, 1)
-            angSep = math.acos(dot)
-        end
-
-        score = score + (distZ*0.6 + fDistZ*0.4 + angSep*2.0) * weight
-    end
-    return score
-end
-
-local function getBestSafePos(threats, now)
-    -- FIX v21: invalidate cache when threat count changes
-    local tCount = #threats
-    if cachedSafePos
-       and (now - lastSafePosTime) < SCORE_UPDATE_RATE
-       and tCount == lastThreatCount then
-        return cachedSafePos
-    end
-    lastThreatCount = tCount
-
-    if tCount == 0 then
-        cachedSafePos   = mapCenter
-        lastSafePosTime = now
-        return mapCenter
-    end
-
-    local bestScore = -math.huge
-    local bestPos   = mapCenter
-    local floorY    = ARENA_FLOOR_Y + 0.5
-
-    for _, radius in ipairs({INNER_RADIUS, OUTER_RADIUS}) do
-        local ringBest = -math.huge
-        local ringPos  = mapCenter
-        for i = 0, SCORE_ANGLES - 1 do
-            local angle = (i / SCORE_ANGLES) * math.pi * 2
-            local cand  = Vector3.new(
-                MAP_CENTER_X + math.cos(angle) * radius,
-                floorY,
-                MAP_CENTER_Z + math.sin(angle) * radius
-            )
-            local s = scorePosition(cand, threats)
-            if s > ringBest then ringBest=s; ringPos=cand end
-        end
-        local eff = (radius == INNER_RADIUS) and ringBest or (ringBest - OUTER_BONUS_THRESH)
-        if eff > bestScore then bestScore=eff; bestPos=ringPos end
-    end
-
-    cachedSafePos   = bestPos
-    lastSafePosTime = now
-    return bestPos
-end
-
--- ==========================================
--- HELPERS
--- ==========================================
-local function clampToSafe(pos)
-    local dx  = pos.X - MAP_CENTER_X
-    local dz  = pos.Z - MAP_CENTER_Z
-    local mag = math.sqrt(dx*dx + dz*dz)
-    if mag > safeRadius then
-        local scale = safeRadius / mag
-        return Vector3.new(MAP_CENTER_X + dx*scale, pos.Y, MAP_CENTER_Z + dz*scale)
+local function clamp(pos)
+    local dx=pos.X-MAP_X; local dz=pos.Z-MAP_Z
+    local m=math.sqrt(dx*dx+dz*dz)
+    if m>ARENA_R then
+        local s=ARENA_R/m
+        return Vector3.new(MAP_X+dx*s, pos.Y, MAP_Z+dz*s)
     end
     return pos
 end
 
-local function getJumpPhysics()
-    local g  = workspace.Gravity
-    local jp = humanoid.UseJumpPower
-        and humanoid.JumpPower
-        or  math.sqrt(2*g*humanoid.JumpHeight)
-    local tAir = (2*jp)/g
-    return jp, tAir, g, humanoid.WalkSpeed
+local function futureCF(laser, vel, av, t)
+    local fp  = laser.Position + vel*t
+    local ba  = math.atan2(laser.CFrame.LookVector.X, laser.CFrame.LookVector.Z)
+    return CFrame.new(fp) * CFrame.Angles(0, ba+av*t, 0)
 end
 
-local function farSideTarget(laser, side)
-    local laserZ = Vector3.new(laser.CFrame.LookVector.X, 0, laser.CFrame.LookVector.Z)
-    if laserZ.Magnitude < 0.01 then laserZ = Vector3.new(1,0,0) end
-    laserZ = laserZ.Unit
-    local tgt = laser.Position + laserZ * (-side * FAR_SIDE_DIST)
-    return clampToSafe(Vector3.new(tgt.X, ARENA_FLOOR_Y+0.5, tgt.Z))
-end
-
--- FIX v21: return true when angVelY near zero (safe default)
-local function laserSweepingToward(laser, angVelY)
-    if math.abs(angVelY) < 0.05 then return true end  -- FIX v21
-    local playerPos = rootPart.Position
-    local toPlayer  = Vector3.new(playerPos.X-laser.Position.X, 0, playerPos.Z-laser.Position.Z)
-    if toPlayer.Magnitude < 0.01 then return true end
-    local fwd = Vector3.new(laser.CFrame.LookVector.X, 0, laser.CFrame.LookVector.Z)
-    if fwd.Magnitude < 0.01 then return true end
-    local right = Vector3.new(fwd.Z, 0, -fwd.X)
-    local playerRight = right:Dot(toPlayer)
-    return (angVelY * playerRight) > 0
+local function getLaserMotion(laser, oldCF, dt)
+    if not oldCF or dt<0.001 then return Vector3.zero,0 end
+    local tv  = (laser.Position - oldCF.Position)/dt
+    local of  = Vector3.new(oldCF.LookVector.X,0,oldCF.LookVector.Z)
+    local nf  = Vector3.new(laser.CFrame.LookVector.X,0,laser.CFrame.LookVector.Z)
+    local av  = 0
+    if of.Magnitude>0.01 and nf.Magnitude>0.01 then
+        av = of:Cross(nf).Y / dt
+    end
+    local hL  = laser.Size.Z/2
+    local pd  = Vector3.new(nf.Z,0,-nf.X)*math.sign(av+1e-9)
+    return tv + pd*math.abs(av)*hL, av
 end
 
 -- ==========================================
--- ARC PREDICTION
+-- ARC SAFETY CHECK
 -- ==========================================
-local function predictArc(lasers, vels, angVels, moveDir, startPos, timeOffset)
-    if #lasers==0 then return true, math.huge end
-    local jp, tAir, g, ws = getJumpPhysics()
+-- Returns (safe:bool, minGap:number)
+-- Checks ALL lasers in the threats list
+local function arcSafe(threats, dir, startPos, timeOffset)
+    if #threats==0 then return true, 999 end
+    local jp, tAir, g, ws = getJump()
     timeOffset = timeOffset or 0
+    local sp  = startPos or root.Position
+    local safe= true
+    local mg  = math.huge
 
-    local md = moveDir
-    if not md or md.Magnitude<0.01 then md=rootPart.CFrame.LookVector end
-    md = Vector3.new(md.X,0,md.Z)
-    if md.Magnitude>0.01 then md=md.Unit end
+    local md = Vector3.new(dir.X,0,dir.Z)
+    if md.Magnitude>0.01 then md=md.Unit else return false,0 end
 
-    local ts   = tAir/ARC_DOT_COUNT
-    local sp   = startPos or rootPart.Position
-    local safe = true
-    local minGap = math.huge
-
-    for i = 1, ARC_DOT_COUNT do
+    local ts = tAir/ARC_DOTS
+    for i=1,ARC_DOTS do
         local t  = i*ts
         local tp = Vector3.new(
             sp.X + md.X*ws*t,
             sp.Y + jp*t - 0.5*g*t*t,
             sp.Z + md.Z*ws*t
         )
-        for li, laser in ipairs(lasers) do
-            local fcf = futureLaserCF(laser, vels[li], angVels[li], t+timeOffset)
+        for _,th in ipairs(threats) do
+            local fcf = futureCF(th.laser, th.vel, th.av, t+timeOffset)
             local lp  = fcf:PointToObjectSpace(tp)
-            local bX  = laser.Size.X/2 + PAD_X
-            local bY  = laser.Size.Y/2 + PAD_Y
-            local bZ  = laser.Size.Z/2 + PAD_Z
-            if math.abs(lp.X)<bX and math.abs(lp.Y)<bY and math.abs(lp.Z)<bZ then safe=false end
-            local gap = math.min(bX-math.abs(lp.X), bY-math.abs(lp.Y), bZ-math.abs(lp.Z))
-            minGap = math.min(minGap, math.abs(gap))
+            local bX  = th.laser.Size.X/2+PAD_X
+            local bY  = th.laser.Size.Y/2+PAD_Y
+            local bZ  = th.laser.Size.Z/2+PAD_Z
+            if math.abs(lp.X)<bX and math.abs(lp.Y)<bY and math.abs(lp.Z)<bZ then
+                safe=false
+            end
+            local g2 = math.min(
+                bX - math.abs(lp.X),
+                bY - math.abs(lp.Y),
+                bZ - math.abs(lp.Z)
+            )
+            mg = math.min(mg, math.abs(g2))
         end
     end
 
+    -- Also check landing spot
     if safe then
-        local landPos = clampToSafe(Vector3.new(sp.X+md.X*ws*tAir, sp.Y, sp.Z+md.Z*ws*tAir))
-        for li, laser in ipairs(lasers) do
-            local fcf = futureLaserCF(laser, vels[li], angVels[li], tAir+timeOffset)
-            local lp  = fcf:PointToObjectSpace(landPos)
-            if math.abs(lp.X)<laser.Size.X/2+PAD_X and math.abs(lp.Z)<laser.Size.Z/2+PAD_Z then
+        local lp = clamp(Vector3.new(sp.X+md.X*ws*tAir, FLOOR_Y+0.5, sp.Z+md.Z*ws*tAir))
+        for _,th in ipairs(threats) do
+            local fcf = futureCF(th.laser, th.vel, th.av, tAir+timeOffset)
+            local op  = fcf:PointToObjectSpace(lp)
+            if math.abs(op.X)<th.laser.Size.X/2+PAD_X
+            and math.abs(op.Z)<th.laser.Size.Z/2+PAD_Z then
                 safe=false
             end
         end
     end
 
-    return safe, minGap
+    return safe, mg
 end
 
 -- ==========================================
--- PATH VISUALIZER (v21 - runs every frame)
+-- COLLECT THREATS
 -- ==========================================
-local function updatePathViz(threats, bestSafe, lasers, vels, avs)
-    -- Safe pos marker
-    if bestSafe then
-        safePosMarker.Position    = bestSafe
-        safePosMarker.Transparency = 0.25
-    else
-        safePosMarker.Transparency = 1
-    end
+local function collectThreats(dt)
+    local out = {}
+    local pp  = root.Position
 
-    if #threats == 0 then
-        for s = 1, PATH_STEPS do
-            local pool = stepPools[s]
-            for _, p in ipairs(pool.walkDots)  do p.Transparency=1 end
-            for _, p in ipairs(pool.walkConns) do p.Transparency=1 end
-            for _, p in ipairs(pool.arcDots)   do p.Transparency=1 end
-            pool.landSphere.Transparency=1
-        end
-        return
-    end
-
-    local jp, tAir, g, ws = getJumpPhysics()
-    local floorY    = ARENA_FLOOR_Y + 0.5
-    local simPos    = rootPart.Position
-    local timeOffset = 0
-
-    for s = 1, PATH_STEPS do
-        local pool = stepPools[s]
-
-        -- Direction: toward best safe pos
-        local toSafe = bestSafe
-            and Vector3.new(bestSafe.X-simPos.X, 0, bestSafe.Z-simPos.Z)
-            or  Vector3.new(1,0,0)
-        local simDir = toSafe.Magnitude>0.01 and toSafe.Unit or Vector3.new(1,0,0)
-
-        -- ---- Walk segment ----
-        local stepDist   = WALK_SIM_DIST / WALK_DOT_COUNT
-        local walkSpeed  = math.max(ws, 1)
-        local prevWalkPos = simPos
-        local walkDanger  = false
-
-        for i = 1, WALK_DOT_COUNT do
-            local t   = (i * stepDist) / walkSpeed
-            local pos = Vector3.new(
-                simPos.X + simDir.X * i * stepDist,
-                floorY,
-                simPos.Z + simDir.Z * i * stepDist
-            )
-            -- clamp to arena
-            local dx  = pos.X - MAP_CENTER_X
-            local dz  = pos.Z - MAP_CENTER_Z
-            local mag = math.sqrt(dx*dx+dz*dz)
-            if mag > safeRadius then
-                local sc = safeRadius/mag
-                pos = Vector3.new(MAP_CENTER_X+dx*sc, floorY, MAP_CENTER_Z+dz*sc)
-            end
-
-            -- Check danger at this walk step
-            for li, laser in ipairs(lasers) do
-                local fcf    = futureLaserCF(laser, vels[li], avs[li], t + timeOffset)
-                local objPos = fcf:PointToObjectSpace(pos)
-                local bX = laser.Size.X/2 + PAD_X
-                local bY = laser.Size.Y/2 + PAD_Y
-                local bZ = laser.Size.Z/2 + PAD_Z
-                if math.abs(objPos.X)<bX and math.abs(objPos.Y)<bY and math.abs(objPos.Z)<bZ then
-                    walkDanger = true
-                end
-            end
-
-            local walkColor = walkDanger and COLOR_WALK_DANGER or COLOR_WALK_SAFE
-            local dot = pool.walkDots[i]
-            dot.Position    = pos
-            dot.Color       = walkColor
-            dot.Transparency = 0.2
-
-            -- Connector line
-            local conn = pool.walkConns[i]
-            local diff = pos - prevWalkPos
-            local len  = diff.Magnitude
-            if len > 0.05 then
-                conn.Size        = Vector3.new(0.12, 0.12, len)
-                conn.CFrame      = CFrame.lookAt((prevWalkPos+pos)*0.5, pos)
-                conn.Color       = walkColor
-                conn.Transparency = 0.5
-            else
-                conn.Transparency = 1
-            end
-            prevWalkPos = pos
-        end
-
-        local walkTime = WALK_SIM_DIST / walkSpeed
-        timeOffset = timeOffset + walkTime
-
-        -- Walk end = last walk dot position
-        local walkEnd = pool.walkDots[WALK_DOT_COUNT].Position
-
-        -- ---- Find best jump direction (8 candidates) ----
-        local bestJumpScore = -math.huge
-        local bestJumpDir   = simDir
-        local bestJumpSafe  = false
-        local bestJumpGap   = 0
-
-        for ci = 0, 7 do
-            local angle = (ci / 8) * math.pi * 2
-            local dir   = Vector3.new(math.cos(angle), 0, math.sin(angle))
-            local safe, gap = predictArc(lasers, vels, avs, dir, walkEnd, timeOffset)
-            local landX = walkEnd.X + dir.X * ws * tAir
-            local landZ = walkEnd.Z + dir.Z * ws * tAir
-            local cDist = math.sqrt((landX-MAP_CENTER_X)^2 + (landZ-MAP_CENTER_Z)^2)
-            local score = (safe and 100 or 0) + gap - cDist*0.05
-            if score > bestJumpScore then
-                bestJumpScore = score
-                bestJumpDir   = dir
-                bestJumpSafe  = safe
-                bestJumpGap   = gap
-            end
-        end
-
-        -- ---- Simulate jump arc ----
-        local arcColor
-        if not bestJumpSafe then
-            arcColor = COLOR_ARC_UNSAFE
-        elseif bestJumpGap < TIGHT_CLEARANCE then
-            arcColor = COLOR_ARC_TIGHT
-        else
-            arcColor = COLOR_ARC_SAFE
-        end
-
-        local ts2 = tAir / ARC_DOT_COUNT
-        local landPos = walkEnd
-
-        for i = 1, ARC_DOT_COUNT do
-            local t   = i * ts2
-            local pos = Vector3.new(
-                walkEnd.X + bestJumpDir.X * ws * t,
-                walkEnd.Y + jp*t - 0.5*g*t*t,
-                walkEnd.Z + bestJumpDir.Z * ws * t
-            )
-            local dot = pool.arcDots[i]
-            dot.Position    = pos
-            dot.Color       = arcColor
-            dot.Transparency = 0.1
-            if i == ARC_DOT_COUNT then
-                landPos = Vector3.new(pos.X, floorY, pos.Z)
-            end
-        end
-
-        -- Landing sphere
-        local clamped = clampToSafe(landPos)
-        pool.landSphere.Position    = clamped
-        pool.landSphere.Color       = bestJumpSafe and COLOR_LAND_SAFE or COLOR_LAND_UNSAFE
-        pool.landSphere.Transparency = 0.15
-
-        -- Advance sim to landing
-        simPos     = clamped
-        timeOffset = timeOffset + tAir + 0.05
-    end
-end
-
--- ==========================================
--- 2D LINE INTERSECTION
--- ==========================================
-local function findLaserIntersection(laserA, laserB)
-    local ax=laserA.Position.X; local az=laserA.Position.Z
-    local adx=laserA.CFrame.LookVector.X; local adz=laserA.CFrame.LookVector.Z
-    local bx=laserB.Position.X; local bz=laserB.Position.Z
-    local bdx=laserB.CFrame.LookVector.X; local bdz=laserB.CFrame.LookVector.Z
-    local denom = adx*bdz - adz*bdx
-    if math.abs(denom)<0.01 then return nil end
-    local dx=bx-ax; local dz=bz-az
-    local t=(dx*bdz - dz*bdx)/denom
-    return Vector3.new(ax+t*adx, ARENA_FLOOR_Y+0.5, az+t*adz), t
-end
-
--- ==========================================
--- LASER COLLECTION
--- ==========================================
-local function collectThreats(dt, now)
-    local threats   = {}
-    local playerPos = rootPart.Position
-    local sp = (now-lastDebugPrint)>=DEBUG_INTERVAL
-
-    for _, item in ipairs(lasersFolder:GetChildren()) do
+    for _,item in ipairs(lasersFolder:GetChildren()) do
         if not item:IsA("BasePart") then continue end
-        item.CanCollide = false
+        item.CanCollide=false
 
-        local objPos      = item.CFrame:PointToObjectSpace(playerPos)
-        local localZ      = math.abs(objPos.Z)
-        local currentSide = math.sign(objPos.Z); if currentSide==0 then currentSide=1 end
-        local worldDist   = (item.Position-playerPos).Magnitude
+        local wd = (item.Position-pp).Magnitude
+        if wd>WORLD_RESET then passed[item]=false; lastSide[item]=nil; continue end
 
-        local oldCF = lastLaserCFrames[item]
-        lastLaserCFrames[item] = item.CFrame
-        local tipVel, angVelY = getLaserMotion(item, oldCF, dt)
-        lastLaserAngVel[item] = angVelY
-        local speed = tipVel.Magnitude
+        local objPos  = item.CFrame:PointToObjectSpace(pp)
+        local localZ  = math.abs(objPos.Z)
+        local curSide = math.sign(objPos.Z); if curSide==0 then curSide=1 end
 
-        if worldDist > RESET_WORLD_DIST then
-            laserPassedFlag[item]=false; lastLaserSide[item]=nil; continue
-        end
+        local oldCF = lastCF[item]
+        lastCF[item] = item.CFrame
+        local vel, av = getLaserMotion(item, oldCF, dt)
+        local spd = vel.Magnitude
 
-        if not laserPassedFlag[item] then
-            if speed > LASER_MOVE_THRESHOLD then
-                local toP = Vector3.new(playerPos.X-item.Position.X,0,playerPos.Z-item.Position.Z)
-                local fv  = Vector3.new(tipVel.X,0,tipVel.Z)
-                local dot = toP.Magnitude>0.01 and fv:Dot(toP.Unit) or 0
-                if dot<-0.3 and localZ<PASS_CONFIRM_DIST then
-                    laserPassedFlag[item]=true
-                    if sp then print("[PASSED-VEL] "..item.Name) end
+        -- Check if laser has passed
+        if not passed[item] then
+            if spd > LASER_MIN_SPD then
+                local toP = Vector3.new(pp.X-item.Position.X, 0, pp.Z-item.Position.Z)
+                local fv  = Vector3.new(vel.X,0,vel.Z)
+                if toP.Magnitude>0.01 then
+                    local dot = fv:Dot(toP.Unit)
+                    if dot < PASS_VEL_DOT and localZ < PASS_DIST then
+                        passed[item]=true
+                    end
                 end
-                local prevSide=lastLaserSide[item]
-                if prevSide and prevSide~=currentSide then
-                    laserPassedFlag[item]=true
-                    if sp then print("[PASSED-FLIP] "..item.Name) end
-                end
+                local prev=lastSide[item]
+                if prev and prev~=curSide then passed[item]=true end
             end
         end
 
-        lastLaserSide[item]=currentSide
-        if laserPassedFlag[item] then continue end
-        if localZ > AGGRO_DISTANCE then continue end
+        lastSide[item]=curSide
+        if passed[item] then continue end
+        if localZ>AGGRO_DIST then continue end
 
-        local tti = speed>0.1 and (localZ/speed) or localZ
+        local tti = spd>0.1 and (localZ/spd) or 999
 
-        -- FIX v21: only apply lookahead confirmation when far enough away
-        local confirmThreat = true
-        if speed > 0.1 and localZ > 5 then
-            local fcf = futureLaserCF(item, tipVel, angVelY, CONFIRM_TTI_LOOKAHEAD)
-            local fop = fcf:PointToObjectSpace(playerPos)
-            if math.abs(fop.Z) > localZ + 1.5 then
-                confirmThreat = false
-            end
-        end
-        if not confirmThreat then continue end
-
-        if sp then
-            print(string.format("[DBG] '%s' lZ=%.1f TTI=%.2f spd=%.1f",item.Name,localZ,tti,speed))
+        -- Reject if laser is moving AWAY from player
+        if spd > LASER_MIN_SPD then
+            local fcf = futureCF(item, vel, av, 0.1)
+            local fop = fcf:PointToObjectSpace(pp)
+            if math.abs(fop.Z) > localZ + 2.0 then continue end
         end
 
-        table.insert(threats, {
+        table.insert(out, {
             laser=item, localZ=localZ, tti=tti,
-            velocity=tipVel, angVelY=angVelY, objPos=objPos,
-            side=currentSide, worldDist=worldDist, speed=speed,
+            vel=vel, av=av, objPos=objPos,
+            side=curSide, wd=wd, spd=spd
         })
     end
 
-    if sp then lastDebugPrint=now end
-    return threats
+    table.sort(out, function(a,b) return a.tti<b.tti end)
+    return out
 end
 
 -- ==========================================
--- CROSSING DETECTION
+-- PERPENDICULAR JUMP DIRECTION
 -- ==========================================
-local function findCrossing(threats)
-    local playerPos = rootPart.Position
-    local bestDist  = MAX_CROSS_DIST
-    local bestPt,bestA,bestB = nil,nil,nil
+-- Returns the best direction to jump straight
+-- over a laser. Tries straight perp first, then
+-- small angle adjustments if unsafe.
+local function getBestJumpDir(primary, threats)
+    local laser = primary.laser
 
-    for i=1,#threats do
-        for j=i+1,#threats do
-            local a=threats[i]; local b=threats[j]
-            if a.worldDist>CROSS_BOTH_DIST or b.worldDist>CROSS_BOTH_DIST then continue end
-            local pt,t = findLaserIntersection(a.laser, b.laser)
-            if not pt then continue end
-            if t and t<-5 then continue end
-            local toP = Vector3.new(pt.X-playerPos.X, 0, pt.Z-playerPos.Z)
-            if toP.Magnitude < MIN_CROSS_AHEAD then continue end
-            local approachDir = Vector3.new(
-                a.laser.Position.X-playerPos.X, 0, a.laser.Position.Z-playerPos.Z)
-            if approachDir.Magnitude>0.01 then
-                approachDir=approachDir.Unit
-                if toP.Unit:Dot(approachDir)<0 then continue end
-            end
-            local d = toP.Magnitude
-            if d<bestDist then bestDist=d; bestPt=pt; bestA=a; bestB=b end
+    -- Perpendicular to the laser's length axis
+    -- laser.CFrame.LookVector points along the laser length
+    -- perpendicular (across width) = RightVector
+    local fwd   = Vector3.new(laser.CFrame.LookVector.X, 0, laser.CFrame.LookVector.Z)
+    if fwd.Magnitude < 0.01 then fwd = Vector3.new(1,0,0) end
+    fwd = fwd.Unit
+
+    -- There are two perp directions: +right or -right
+    -- Pick the one that takes us AWAY from arena edge (stays more central)
+    local perpA = Vector3.new(fwd.Z, 0, -fwd.X)   -- right of laser
+    local perpB = Vector3.new(-fwd.Z, 0, fwd.X)   -- left of laser
+
+    -- Both directions should land us on the other side of the laser
+    -- The laser is a slab: we want to land past it
+    -- Choose the side that results in landing closer to arena center
+    local jp, tAir, _, ws = getJump()
+    local sp = root.Position
+
+    local function landDist(dir)
+        local lp = clamp(Vector3.new(sp.X+dir.X*ws*tAir, FLOOR_Y+0.5, sp.Z+dir.Z*ws*tAir))
+        local dx=lp.X-MAP_X; local dz=lp.Z-MAP_Z
+        return math.sqrt(dx*dx+dz*dz)
+    end
+
+    -- Primary candidate: the perp direction that lands more centrally
+    local baseDir = (landDist(perpA) <= landDist(perpB)) and perpA or perpB
+
+    -- Try angle sweep to find safe arc
+    for _, deg in ipairs(ANGLE_STEPS) do
+        local rad = math.rad(deg)
+        local cos = math.cos(rad); local sin = math.sin(rad)
+        local testDir = Vector3.new(
+            baseDir.X*cos - baseDir.Z*sin,
+            0,
+            baseDir.X*sin + baseDir.Z*cos
+        )
+        local safe, gap = arcSafe(threats, testDir, nil, 0)
+        if safe then
+            return testDir, true, gap
         end
     end
-    return bestPt,bestA,bestB
+
+    -- Try the other perpendicular direction too
+    local altBase = (baseDir == perpA) and perpB or perpA
+    for _, deg in ipairs(ANGLE_STEPS) do
+        local rad = math.rad(deg)
+        local cos = math.cos(rad); local sin = math.sin(rad)
+        local testDir = Vector3.new(
+            altBase.X*cos - altBase.Z*sin,
+            0,
+            altBase.X*sin + altBase.Z*cos
+        )
+        local safe, gap = arcSafe(threats, testDir, nil, 0)
+        if safe then
+            return testDir, true, gap
+        end
+    end
+
+    -- Nothing safe found — return best guess
+    return baseDir, false, 0
 end
 
 -- ==========================================
--- LOOKAHEAD PLANNER
+-- SAFE POSITION
 -- ==========================================
-local function runPlanner(threats)
-    if #threats==0 then return nil end
-    local _, tAir, _, ws = getJumpPhysics()
-    local waypoints = {}
-    local simPos    = rootPart.Position
-    local timeAcc   = 0
-
-    local allLasers={};  local allVels={};  local allAVs={}
-    for _,t in ipairs(threats) do
-        table.insert(allLasers, t.laser)
-        table.insert(allVels,   t.velocity)
-        table.insert(allAVs,    t.angVelY)
+local function scorePos(pos, threats)
+    local score = 0
+    for _,th in ipairs(threats) do
+        local op   = th.laser.CFrame:PointToObjectSpace(pos)
+        local lZ   = math.abs(op.Z)
+        local tti  = math.max(th.tti, 0.05)
+        local fop  = futureCF(th.laser, th.vel, th.av, tti*0.5):PointToObjectSpace(pos)
+        local fZ   = math.abs(fop.Z)
+        score = score + (lZ*0.5 + fZ*0.5) / tti
     end
+    return score
+end
 
-    for _ = 1, PLAN_STEPS do
-        local bestScore=-math.huge; local bestLand=nil
-        for ci=0,PLAN_CANDIDATES-1 do
-            local angle = (ci/PLAN_CANDIDATES)*math.pi*2
-            local dir   = Vector3.new(math.cos(angle), 0, math.sin(angle))
-            local safe,gap = predictArc(allLasers,allVels,allAVs, dir, simPos, timeAcc)
-            if safe then
-                local lp = clampToSafe(Vector3.new(
-                    simPos.X+dir.X*ws*tAir, simPos.Y, simPos.Z+dir.Z*ws*tAir))
-                local score = gap - (mapCenter-lp).Magnitude*0.1
-                if score>bestScore then bestScore=score; bestLand=lp end
-            end
-        end
-        if not bestLand then break end
-        table.insert(waypoints, bestLand)
-        simPos  = bestLand
-        timeAcc = timeAcc + tAir + 0.1
+local function getBestSafe(threats, now)
+    if cachedSafe and (now-lastSafeTime)<SAFE_UPDATE_HZ then
+        return cachedSafe
     end
+    if #threats==0 then
+        cachedSafe=mapCenter; lastSafeTime=now; return mapCenter
+    end
+    local best=-math.huge; local bestPos=mapCenter
+    local fy = FLOOR_Y+0.5
+    for i=0,SAFE_SCORE_ANGLES-1 do
+        local a = (i/SAFE_SCORE_ANGLES)*math.pi*2
+        local c = Vector3.new(
+            MAP_X + math.cos(a)*SAFE_RADIUS_RING,
+            fy,
+            MAP_Z + math.sin(a)*SAFE_RADIUS_RING
+        )
+        local s = scorePos(c, threats)
+        if s>best then best=s; bestPos=c end
+    end
+    -- Also check center
+    local cs = scorePos(mapCenter, threats)
+    if cs>best then bestPos=mapCenter end
 
-    return #waypoints>0 and {waypoints=waypoints} or nil
+    cachedSafe=bestPos; lastSafeTime=now; return bestPos
+end
+
+-- ==========================================
+-- MOVEMENT HELPERS
+-- ==========================================
+local function moveTo(pos)
+    if lastMovePos then
+        local dx=pos.X-lastMovePos.X; local dz=pos.Z-lastMovePos.Z
+        if dx*dx+dz*dz < MOVE_THRESH*MOVE_THRESH then return end
+    end
+    lastMovePos=pos; hum:MoveTo(pos)
+end
+
+local function clearMove() lastMovePos=nil end
+
+local function onArena()
+    local p=root.Position
+    local dx=p.X-MAP_X; local dz=p.Z-MAP_Z
+    return math.sqrt(dx*dx+dz*dz)<=(ARENA_R+6)
+        and p.Y>=FLOOR_Y-1 and p.Y<=FLOOR_Y+9
 end
 
 -- ==========================================
 -- MAIN LOOP
 -- ==========================================
 RunService.Heartbeat:Connect(function(dt)
-    if not character or humanoid.Health<=0 then
-        hideAllViz()
-        setStatus("\xe2\x97\x89 Dead", Color3.fromRGB(255,80,80))
-        clearMoveTarget(); return
+    if not char or hum.Health<=0 then
+        hideArc(); safeDot.Transparency=1
+        setStatus("Dead",Color3.fromRGB(255,80,80))
+        clearMove(); return
     end
 
     local now = tick()
+    lTimer.Text = string.format("[v22] %.1fs", now-runStart)
 
-    if not checkOnArena() then
-        hideAllViz()
-        setStatus("\xe2\x97\x89 Off arena", Color3.fromRGB(180,180,180))
-        timerLabel.Text = string.format("\xe2\x8f\xb1  %.1fs", now-runStart)
-        lastRootPos=nil; clearMoveTarget(); return
+    if not onArena() then
+        hideArc(); safeDot.Transparency=1
+        setStatus("Off arena",Color3.fromRGB(180,180,180))
+        clearMove(); lastRootPos=nil; return
     end
 
-    timerLabel.Text = string.format("\xe2\x8f\xb1  %.1fs", now-runStart)
-    jumpLabel.Text  = string.format("\xf0\x9f\xa6\x98 Jumps: %d", jumpCount)
-
-    local realMoveDir = Vector3.zero
+    -- Track real movement direction
     if lastRootPos then
-        local flat = Vector3.new(
-            rootPart.Position.X-lastRootPos.X, 0,
-            rootPart.Position.Z-lastRootPos.Z)
-        if flat.Magnitude>0.005 then realMoveDir=flat.Unit end
+        local fl=Vector3.new(root.Position.X-lastRootPos.X,0,root.Position.Z-lastRootPos.Z)
+        if fl.Magnitude>0.005 then realMoveDir=fl.Unit end
     end
-    lastRootPos = rootPart.Position
+    lastRootPos=root.Position
 
-    local threats = collectThreats(dt, now)
-
-    -- Build flat laser arrays for viz/prediction
-    local allLasers={};  local allVels={};  local allAVs={}
-    for _,t in ipairs(threats) do
-        table.insert(allLasers, t.laser)
-        table.insert(allVels,   t.velocity)
-        table.insert(allAVs,    t.angVelY)
-    end
-
-    local bestSafe = getBestSafePos(threats, now)
-
-    -- Update HUD safe pos label
-    local dxS = bestSafe.X - MAP_CENTER_X
-    local dzS = bestSafe.Z - MAP_CENTER_Z
-    safeLabel.Text = string.format("\xf0\x9f\x9f\xa2 SafePos: %.1f studs",
-        math.sqrt(dxS*dxS+dzS*dzS))
-
-    -- ---- PATH VISUALIZER (every frame) ----
-    updatePathViz(threats, bestSafe, allLasers, allVels, allAVs)
-
-    local state   = humanoid:GetState()
-    local isInAir = state==Enum.HumanoidStateType.Freefall
+    local threats = collectThreats(dt)
+    local state   = hum:GetState()
+    local inAir   = state==Enum.HumanoidStateType.Freefall
                  or state==Enum.HumanoidStateType.Jumping
     local canJump = (now-lastJumpTime)>=JUMP_COOLDOWN
 
-    if isInAir and jumpStartTime==0 then jumpStartTime=now end
-    if not isInAir then jumpStartTime=0; didAirdash=false end
-
-    local dashReady = not didAirdash and isInAir
-        and (now-jumpStartTime)>=AIRDASH_CHECK_START
-        and (now-lastAirdashTime)>=AIRDASH_COOLDOWN
-    dashLabel.Text = dashReady
-        and "\xe2\x9a\xa1 Dash: READY"
-        or  "\xe2\x9a\xa1 Dash: "..(didAirdash and "used" or "wait")
-    dashLabel.TextColor3 = dashReady
-        and Color3.fromRGB(255,100,200) or Color3.fromRGB(120,120,120)
-
-    if #threats==0 then
-        crossLabel.Text       = "\xe2\x9c\x96 No crossing"
-        crossLabel.TextColor3 = Color3.fromRGB(120,200,255)
-        setStatus("\xe2\x97\x89 Safe \xe2\x80\x93 optimal pos", Color3.fromRGB(80,220,160))
-        if not isInAir then smartMoveTo(bestSafe) end
-        currentPlan=nil; return
-    end
-
-    local crossPoint,crossA,crossB = findCrossing(threats)
-    if crossPoint then
-        crossLabel.Text       = string.format("\xe2\x9c\x96 CROSS: %s+%s",crossA.laser.Name,crossB.laser.Name)
-        crossLabel.TextColor3 = Color3.fromRGB(0,220,255)
-        crossMarker.Position  = crossPoint; crossMarker.Transparency=0
+    -- ---- Update HUD TTI ----
+    if #threats>0 then
+        lTTI.Text = string.format("TTI: %.2fs  lZ=%.1f", threats[1].tti, threats[1].localZ)
     else
-        crossLabel.Text       = "\xe2\x9c\x96 No crossing"
-        crossLabel.TextColor3 = Color3.fromRGB(120,200,255)
-        crossMarker.Transparency=1
+        lTTI.Text = "TTI: safe"
     end
 
-    table.sort(threats, function(a,b) return a.tti<b.tti end)
-    local primary = threats[1]
+    local bestSafe = getBestSafe(threats, now)
+    safeDot.Position=bestSafe; safeDot.Transparency=0.3
 
-    -- FIX v21: sweepingToward defaults true at angVelY~=0
-    local sweepingToward = laserSweepingToward(primary.laser, primary.angVelY)
-
-    if now-lastPlanTime >= PLAN_INTERVAL then
-        lastPlanTime=now; currentPlan=runPlanner(threats)
-    end
-
-    -- ---- Air-dash ----
-    -- FIX v21: no longer returns early if no dash found
-    local didExecuteDash = false
-    if isInAir and dashReady then
-        local chkL={primary.laser}; local chkV={primary.velocity}; local chkA={primary.angVelY}
-        local airSafe = predictArc(chkL,chkV,chkA, realMoveDir, nil, 0)
-        if not airSafe then
-            local dashTarget=nil
-            local fwd = realMoveDir.Magnitude>0.01 and realMoveDir or rootPart.CFrame.LookVector
-            fwd = Vector3.new(fwd.X,0,fwd.Z).Unit
-            local right = Vector3.new(fwd.Z,0,-fwd.X)
-            for _, testDir in ipairs({
-                right,-right,fwd,-fwd,
-                (fwd+right).Unit,(fwd-right).Unit,(-fwd+right).Unit,(-fwd-right).Unit
-            }) do
-                if predictArc(chkL,chkV,chkA, testDir, rootPart.Position, 0) then
-                    dashTarget=clampToSafe(rootPart.Position+testDir*15); break
-                end
-            end
-            if dashTarget then
-                print("[AIRDASH] "..primary.laser.Name)
-                lastAirdashTime=now; didAirdash=true
-                clearMoveTarget()
-                humanoid:MoveTo(dashTarget)
-                humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-                setStatus("\xe2\x97\x89 AIR DASH!", Color3.fromRGB(255,100,200))
-                didExecuteDash = true
-            end
-        end
-    end
-
-    -- Already in air: steer to far side (only if no dash executed)
-    if isInAir and not didExecuteDash then
-        smartMoveTo(farSideTarget(primary.laser, primary.side))
+    -- ====== NO THREATS: stand calmly at safe pos ======
+    if #threats==0 then
+        hideArc()
+        jumpPending=false
+        setStatus("Safe - holding pos",Color3.fromRGB(80,220,160))
+        if not inAir then moveTo(bestSafe) end
         return
     end
-    if isInAir then return end
 
-    -- ---- On ground: pick jump target ----
-    local jumpTarget
-    local checkLasers={};  local checkVels={};  local checkAVs={}
-    local isCrossing = crossPoint~=nil
+    local primary = threats[1]
 
-    if isCrossing then
-        local toC = Vector3.new(
-            crossPoint.X-rootPart.Position.X, 0,
-            crossPoint.Z-rootPart.Position.Z)
-        if toC.Magnitude>0.01 then toC=toC.Unit end
-        jumpTarget = clampToSafe(Vector3.new(
-            crossPoint.X + toC.X*CROSS_OVERSHOOT,
-            ARENA_FLOOR_Y+0.5,
-            crossPoint.Z + toC.Z*CROSS_OVERSHOOT))
-        table.insert(checkLasers, crossA.laser); table.insert(checkVels, crossA.velocity); table.insert(checkAVs, crossA.angVelY)
-        table.insert(checkLasers, crossB.laser); table.insert(checkVels, crossB.velocity); table.insert(checkAVs, crossB.angVelY)
-    else
-        jumpTarget = farSideTarget(primary.laser, primary.side)
-        table.insert(checkLasers, primary.laser); table.insert(checkVels, primary.velocity); table.insert(checkAVs, primary.angVelY)
+    -- ====== IN AIR: steer toward landing target ======
+    if inAir then
+        if jumpPending then
+            -- Steer toward our planned landing spot
+            moveTo(jumpPendingTarget)
+        else
+            -- Not our jump, just keep going toward safe
+            moveTo(bestSafe)
+        end
+        return
     end
 
-    local toTgt   = jumpTarget - rootPart.Position
-    local flatTgt = Vector3.new(toTgt.X,0,toTgt.Z)
-    -- FIX v21: always use computed predictDir, never zero vector
-    local predictDir = flatTgt.Magnitude>0.01 and flatTgt.Unit
-        or Vector3.new(rootPart.CFrame.LookVector.X, 0, rootPart.CFrame.LookVector.Z).Unit
+    -- ====== ON GROUND ======
 
-    local triggerNow = canJump and sweepingToward
-        and (primary.localZ<=JUMP_TRIGGER_DISTANCE or primary.tti<=FAST_TTI)
-
-    if triggerNow then
-        local safe,gap = predictArc(checkLasers,checkVels,checkAVs, predictDir, nil, 0)
+    -- Fire a pending jump if its delay has elapsed
+    if jumpPending and now >= jumpPendingTime then
+        -- Re-validate the arc is still safe (threats may have changed)
+        local safe, gap = arcSafe(threats, jumpPendingDir, nil, 0)
         if safe then
-            print(string.format("[JUMP%s] %s lZ=%.2f TTI=%.2f gap=%.2f",
-                isCrossing and "(X)" or "",
-                primary.laser.Name, primary.localZ, primary.tti, gap or 0))
-            lastJumpTime=now; jumpCount=jumpCount+1
-            jumpLabel.Text = string.format("\xf0\x9f\xa6\x98 Jumps: %d", jumpCount)
-            clearMoveTarget()
-            humanoid:MoveTo(jumpTarget)
-            humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-            setStatus(
-                isCrossing and "\xe2\x97\x89 CROSSING JUMP!" or "\xe2\x97\x89 Jumping!",
-                Color3.fromRGB(60,220,100))
+            jumpCount=jumpCount+1
+            lJumps.Text=string.format("Jumps: %d",jumpCount)
+            lastJumpTime=now; jumpPending=false
+            clearMove()
+            hum:MoveTo(jumpPendingTarget)
+            hum:ChangeState(Enum.HumanoidStateType.Jumping)
+            setStatus("JUMP!",Color3.fromRGB(60,255,100))
+            drawArc(root.Position, jumpPendingDir, true)
+            return
         else
-            setStatus("\xe2\x97\x89 Waiting for safe arc\xe2\x80\xa6", Color3.fromRGB(255,120,40))
+            -- Arc became unsafe during reaction delay - cancel and replan
+            jumpPending=false
+            setStatus("Arc unsafe - replanning",Color3.fromRGB(255,120,40))
         end
-    elseif primary.localZ<=APPROACH_START then
-        local approachTarget = sweepingToward and jumpTarget or bestSafe
-        smartMoveTo(approachTarget)
-        setStatus("\xe2\x97\x89 Approaching", Color3.fromRGB(255,180,40))
-    else
-        smartMoveTo(bestSafe)
-        setStatus("\xe2\x97\x89 Optimal pos", Color3.fromRGB(140,180,255))
+    end
+
+    -- Current position safety: is primary threat in our TTI window?
+    local inWindow = primary.tti <= JUMP_MAX_TTI
+    local mustJump = primary.tti <= JUMP_MIN_TTI
+
+    -- ---- Decide whether to reposition or hold ----
+    local needsReposition = primary.tti > REPOSITION_TTI
+
+    if needsReposition and not jumpPending then
+        -- Safe to walk to best position, laser is far away
+        moveTo(bestSafe)
+        setStatus("Walking to safe pos",Color3.fromRGB(140,180,255))
+        hideArc()
+        return
+    end
+
+    -- ---- Laser is approaching: prepare jump ----
+    if inWindow and canJump and not jumpPending then
+        local dir, safe, gap = getBestJumpDir(primary, threats)
+
+        -- Compute landing target
+        local _, tAir, _, ws = getJump()
+        local rawLand = Vector3.new(
+            root.Position.X + dir.X*ws*tAir,
+            FLOOR_Y+0.5,
+            root.Position.Z + dir.Z*ws*tAir
+        )
+        local landTarget = clamp(rawLand)
+
+        drawArc(root.Position, dir, safe)
+
+        if safe then
+            -- Queue jump with human reaction delay
+            local delay = REACT_DELAY_MIN + math.random()*(REACT_DELAY_MAX-REACT_DELAY_MIN)
+            jumpPending       = true
+            jumpPendingTime   = now + delay
+            jumpPendingDir    = dir
+            jumpPendingTarget = landTarget
+            setStatus("Ready to jump...",Color3.fromRGB(255,200,60))
+        else
+            -- No safe arc found
+            if mustJump then
+                -- Have to jump even if risky - find least-bad direction
+                jumpCount=jumpCount+1
+                lJumps.Text=string.format("Jumps: %d",jumpCount)
+                lastJumpTime=now
+                clearMove()
+                hum:MoveTo(landTarget)
+                hum:ChangeState(Enum.HumanoidStateType.Jumping)
+                setStatus("FORCED JUMP",Color3.fromRGB(255,80,80))
+                drawArc(root.Position, dir, false)
+            else
+                -- Wait for better timing
+                moveTo(bestSafe)
+                setStatus("No safe arc yet",Color3.fromRGB(255,120,40))
+            end
+        end
+        return
+    end
+
+    -- ---- Laser too far: hold position ----
+    if not jumpPending then
+        moveTo(bestSafe)
+        setStatus(string.format("Holding - TTI %.2fs",primary.tti),Color3.fromRGB(140,180,255))
+        hideArc()
     end
 end)
