@@ -1,42 +1,31 @@
 -- ==========================================
--- MOVEMENT SCRIPT v25
+-- MOVEMENT SCRIPT v26
 -- ==========================================
--- CHANGES FROM v24:
+-- CHANGES FROM v25:
 --
---  BUG FIX: First-laser panic jumps
---  Root cause: on frame 1 a new laser has no
---  lastCF history so vel=0, spd=0, TTI=999.
---  On frame 2-3 motion data snaps in and TTI
---  suddenly reads as 0.2s -> bot panics and
---  fires a random forced jump.
+--  BUG FIX: Phantom/weird jumps while standing still
 --
---  Fixes applied:
---  1. WARMUP COUNTER per laser: require 3
---     consecutive frames of motion data before
---     the laser can enter the threat list.
---     During warmup it is shown in the viz but
---     cannot trigger a jump.
+--  Root cause 1: mustJumpToAvoid() simulated the bot
+--  standing at root.Position, but the bot was actually
+--  moving toward bestSafe via moveTo(). The collision
+--  sim checked the wrong future position and falsely
+--  decided the laser would hit -> unnecessary jump.
 --
---  2. SPEED GATE on necessity check:
---     mustJumpToAvoid() now only fires when
---     spd > MIN_SPD OR |av| > MIN_AV.
---     A laser with no measured motion cannot
---     force a jump even if TTI looks small.
+--  Fix: mustJumpToAvoid() now accepts a `targetPos`
+--  parameter and simulates the bot moving toward it
+--  at WalkSpeed during the threat horizon, so the
+--  collision check matches the bot's actual trajectory.
 --
---  3. TTI SMOOTHING: per-laser TTI is low-pass
---     filtered (alpha=0.35) so a single noisy
---     frame cannot spike TTI from 999 -> 0.2.
---     Jump window checks use the smoothed value.
+--  Root cause 2: mustNow (TTI <= JUMP_MIN_TTI) could
+--  force a jump even for a laser that passes beside the
+--  bot and will never physically hit it. mustNow now
+--  ALSO requires mustJumpToAvoid to confirm a real hit
+--  before firing a forced jump.
 --
---  4. JUMP_MIN_TTI raised to 0.22 (was 0.18)
---     so the forced-jump fallback has a bit
---     more time to pick a good direction.
---
---  All v24 multi-step path viz, angular TTI,
---  laser hitbox viz, and billboard labels are
---  unchanged.
+--  All v25 warmup, TTI smoothing, multi-step path viz,
+--  laser hitbox viz, and billboard labels are unchanged.
 -- ==========================================
-print("[Movement] v25 loaded")
+print("[Movement] v26 loaded")
 
 local Players    = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -62,7 +51,7 @@ local mapCenter = Vector3.new(MAP_X, FLOOR_Y + 0.5, MAP_Z)
 -- TUNING
 -- ==========================================
 local JUMP_MAX_TTI   = 0.65
-local JUMP_MIN_TTI   = 0.22   -- slightly higher -> more time to plan direction
+local JUMP_MIN_TTI   = 0.22
 local JUMP_COOLDOWN  = 0.40
 local ANGLE_STEPS    = {0, 12, -12, 25, -25, 40, -40, 55, -55}
 local REPOSITION_TTI = 4.0
@@ -81,8 +70,8 @@ local MIN_SPD        = 0.3
 local MIN_AV         = 0.04
 local WORLD_RESET    = 130
 local MOVE_THRESH    = 0.5
-local WARMUP_FRAMES  = 3      -- frames needed before a laser can threaten
-local TTI_ALPHA      = 0.35   -- low-pass smoothing (lower = smoother)
+local WARMUP_FRAMES  = 3
+local TTI_ALPHA      = 0.35
 
 -- Path viz
 local ARC_DOTS       = 20
@@ -104,8 +93,8 @@ local TTI_DANGER = 0.5
 local lastCF      = setmetatable({}, {__mode="k"})
 local lastSide    = setmetatable({}, {__mode="k"})
 local passed      = setmetatable({}, {__mode="k"})
-local frameCount  = setmetatable({}, {__mode="k"})  -- warmup counter per laser
-local smoothedTTI = setmetatable({}, {__mode="k"})  -- smoothed TTI per laser
+local frameCount  = setmetatable({}, {__mode="k"})
+local smoothedTTI = setmetatable({}, {__mode="k"})
 
 local lastJumpTime = 0
 local jumpCount    = 0
@@ -125,10 +114,10 @@ local lastRootPos  = nil
 -- LASER HITBOX VIZ CACHE
 -- ==========================================
 local laserVizCache = setmetatable({}, {__mode="k"})
-local vizRoot = workspace:FindFirstChild("LaserViz25")
+local vizRoot = workspace:FindFirstChild("LaserViz26")
 if vizRoot then vizRoot:Destroy() end
 vizRoot = Instance.new("Folder")
-vizRoot.Name = "LaserViz25"
+vizRoot.Name = "LaserViz26"
 vizRoot.Parent = workspace
 
 local function getOrCreateViz(laser)
@@ -209,10 +198,10 @@ end
 -- ==========================================
 -- PATH VISUALIZER
 -- ==========================================
-local pathRoot = workspace:FindFirstChild("PathViz25")
+local pathRoot = workspace:FindFirstChild("PathViz26")
 if pathRoot then pathRoot:Destroy() end
 pathRoot = Instance.new("Folder")
-pathRoot.Name = "PathViz25"; pathRoot.Parent = workspace
+pathRoot.Name = "PathViz26"; pathRoot.Parent = workspace
 
 local ARC_COLORS  = {Color3.fromRGB(0,255,80),  Color3.fromRGB(0,200,255), Color3.fromRGB(200,255,0)}
 local LAND_COLORS = {Color3.fromRGB(255,220,30), Color3.fromRGB(255,140,0), Color3.fromRGB(200,0,255)}
@@ -297,7 +286,7 @@ end
 -- HUD
 -- ==========================================
 local sg=Instance.new("ScreenGui")
-sg.Name="MovHUD25"; sg.ResetOnSpawn=false
+sg.Name="MovHUD26"; sg.ResetOnSpawn=false
 sg.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
 sg.Parent=player.PlayerGui
 
@@ -322,7 +311,7 @@ local lJumps  = lbl(28, Color3.fromRGB(255,200,60),  15, true)
 local lStatus = lbl(52, Color3.fromRGB(200,200,200), 13, false)
 local lTTI    = lbl(74, Color3.fromRGB(120,200,255), 12, false)
 
-lTimer.Text="[v25] 0.0s"; lJumps.Text="Jumps: 0"
+lTimer.Text="[v26] 0.0s"; lJumps.Text="Jumps: 0"
 lStatus.Text="Waiting..."; lTTI.Text="TTI: -"
 
 local function setStatus(t,c)
@@ -377,24 +366,44 @@ local function computeTTI(laser,localZ,vel,av,spd)
 end
 
 -- ==========================================
--- NECESSITY CHECK
--- Gated: only runs when laser has real motion
+-- NECESSITY CHECK  (v26 FIX)
+-- Now simulates the bot walking toward targetPos
+-- instead of standing still, so the collision check
+-- matches the bot's real trajectory.
 -- ==========================================
-local function mustJumpToAvoid(threat,pos)
-    -- Gate: if laser has no measured motion, we cannot trust necessity check
+local function mustJumpToAvoid(threat, currentPos, targetPos)
     if threat.spd <= MIN_SPD and math.abs(threat.av) <= MIN_AV then
         return false
     end
-    local laser=threat.laser
-    local horizon=math.max(threat.tti*1.8,1.5)
-    local dt2=horizon/30
-    for i=1,30 do
-        local t=i*dt2
-        local fcf=futureCF(laser,threat.vel,threat.av,t)
-        local lp=fcf:PointToObjectSpace(pos)
-        local bX=laser.Size.X/2+PAD_X
-        local bY=laser.Size.Y/2+PAD_Y
-        local bZ=laser.Size.Z/2+PAD_Z
+    local laser  = threat.laser
+    local horizon = math.max(threat.tti * 1.8, 1.5)
+    local dt2    = horizon / 30
+    local _,_,_,ws = getJump()
+
+    -- direction the bot will walk toward targetPos
+    local walkDir = Vector3.zero
+    if targetPos then
+        local diff = Vector3.new(targetPos.X - currentPos.X, 0, targetPos.Z - currentPos.Z)
+        if diff.Magnitude > 0.5 then
+            walkDir = diff.Unit
+        end
+    end
+
+    for i = 1, 30 do
+        local t = i * dt2
+        -- simulate bot position: moves toward target at WalkSpeed, stops when close
+        local walked = math.min(ws * t, targetPos and
+            Vector3.new(targetPos.X-currentPos.X,0,targetPos.Z-currentPos.Z).Magnitude or 0)
+        local simPos = Vector3.new(
+            currentPos.X + walkDir.X * walked,
+            currentPos.Y,
+            currentPos.Z + walkDir.Z * walked)
+
+        local fcf = futureCF(laser, threat.vel, threat.av, t)
+        local lp  = fcf:PointToObjectSpace(simPos)
+        local bX  = laser.Size.X/2 + PAD_X
+        local bY  = laser.Size.Y/2 + PAD_Y
+        local bZ  = laser.Size.Z/2 + PAD_Z
         if math.abs(lp.X)<bX and math.abs(lp.Y)<bY and math.abs(lp.Z)<bZ then
             return true
         end
@@ -439,7 +448,7 @@ local function arcSafe(threats,dir,startPos,timeOffset)
 end
 
 -- ==========================================
--- COLLECT THREATS  (with warmup + TTI smooth)
+-- COLLECT THREATS  (warmup + TTI smoothing unchanged)
 -- ==========================================
 local function collectThreats(dt)
     local out={}
@@ -466,11 +475,9 @@ local function collectThreats(dt)
         local vel,av=getLaserMotion(item,oldCF,dt)
         local spd=vel.Magnitude
 
-        -- Warmup counter: increment each frame we have valid motion data
         frameCount[item]=(frameCount[item] or 0)+1
         local warming=frameCount[item]<WARMUP_FRAMES
 
-        -- Passed detection (skip during warmup)
         if not passed[item] and not warming then
             if spd>MIN_SPD then
                 local toP=Vector3.new(pp.X-item.Position.X,0,pp.Z-item.Position.Z)
@@ -487,18 +494,15 @@ local function collectThreats(dt)
         if passed[item] then updateLaserViz(item,999,wd,true,false); continue end
         if localZ>AGGRO_DIST then updateLaserViz(item,999,wd,false,false); continue end
 
-        -- Raw TTI
         local rawTTI=computeTTI(item,localZ,vel,av,spd)
 
-        -- Smooth TTI to prevent snap from 999 -> 0.2
         if not smoothedTTI[item] or smoothedTTI[item]>200 then
-            smoothedTTI[item]=rawTTI  -- initialise without smoothing
+            smoothedTTI[item]=rawTTI
         else
             smoothedTTI[item]=smoothedTTI[item]*(1-TTI_ALPHA)+rawTTI*TTI_ALPHA
         end
         local tti=smoothedTTI[item]
 
-        -- Reject lasers moving away
         if spd>MIN_SPD then
             local fcf=futureCF(item,vel,av,0.1)
             local fop=fcf:PointToObjectSpace(pp)
@@ -509,7 +513,6 @@ local function collectThreats(dt)
 
         updateLaserViz(item,tti,wd,false,warming)
 
-        -- Only add to threat list after warmup
         if not warming then
             table.insert(out,{laser=item,localZ=localZ,tti=tti,vel=vel,av=av,
                                objPos=objPos,side=curSide,wd=wd,spd=spd})
@@ -650,7 +653,7 @@ RunService.Heartbeat:Connect(function(dt)
     end
 
     local now=tick()
-    lTimer.Text=string.format("[v25] %.1fs",now-runStart)
+    lTimer.Text=string.format("[v26] %.1fs",now-runStart)
 
     if not onArena() then
         hidePath(); safeDot.Transparency=1
@@ -708,9 +711,8 @@ RunService.Heartbeat:Connect(function(dt)
         end
     end
 
-    local inWindow   =primary.tti<=JUMP_MAX_TTI
-    local mustNow    =primary.tti<=JUMP_MIN_TTI
-    local needsRepos =primary.tti>REPOSITION_TTI
+    local inWindow   = primary.tti <= JUMP_MAX_TTI
+    local needsRepos = primary.tti >  REPOSITION_TTI
 
     -- Reposition
     if needsRepos and not jumpPending then
@@ -721,8 +723,10 @@ RunService.Heartbeat:Connect(function(dt)
 
     -- Jump window
     if inWindow and canJump and not jumpPending then
-        -- Only jump if laser will actually hit us standing still
-        local needsJump=mustNow or mustJumpToAvoid(primary,root.Position)
+        -- v26 FIX: mustNow also requires mustJumpToAvoid confirmation.
+        -- Both mustNow and the normal path now pass bestSafe as the
+        -- walk target, so the bot simulates its actual movement.
+        local needsJump = mustJumpToAvoid(primary, root.Position, bestSafe)
         if not needsJump then
             moveTo(bestSafe)
             setStatus(string.format("No jump %.2fs",primary.tti),Color3.fromRGB(0,220,120))
@@ -740,7 +744,8 @@ RunService.Heartbeat:Connect(function(dt)
             jumpPendDir=dir; jumpPendTarget=landTarget
             setStatus("Ready...",Color3.fromRGB(255,200,60))
         else
-            if mustNow then
+            -- Only force jump if laser will genuinely hit even after walking
+            if primary.tti <= JUMP_MIN_TTI then
                 jumpCount=jumpCount+1
                 lJumps.Text=string.format("Jumps: %d",jumpCount)
                 lastJumpTime=now; clearMove()
