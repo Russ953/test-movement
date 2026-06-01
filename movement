@@ -1,177 +1,180 @@
 -- ==========================================
--- MOVEMENT SCRIPT v23
+-- MOVEMENT SCRIPT v24
 -- ==========================================
--- NEW in v23:
---   LASER VISUALIZER
---   Every laser in ActiveLasers gets:
---     1. A neon green SelectionBox that perfectly
---        outlines its hitbox (incl. PAD_X/Y/Z)
---     2. A BillboardGui above it showing:
---        - Laser name
---        - TTI (time-to-impact) in seconds
---        - Distance to player
---        - "PASSED" when the bot has cleared it
---     3. Color coding:
---        - Bright neon green  = safe / far away
---        - Yellow             = getting close (TTI < 1.5s)
---        - Red                = imminent danger (TTI < 0.5s)
---        - Grey / dim         = passed
--- All other v22 logic is unchanged.
+-- CHANGES FROM v23:
+--
+--  1. SMARTER JUMP TRIGGER
+--     - Replaced flat TTI window with angular
+--       velocity prediction: TTI now accounts for
+--       HOW FAST the laser is rotating toward you,
+--       not just linear distance/speed.
+--     - Added NECESSITY CHECK: bot only jumps if
+--       staying put would be unsafe (it checks whether
+--       standing still through the laser's pass would
+--       actually hit you). If the laser will miss even
+--       if you stand still -> NO jump.
+--     - Tightened JUMP_MAX_TTI to 0.65 to reduce
+--       early jumps.
+--
+--  2. MULTI-STEP PATH VISUALIZER
+--     - Shows the complete planned sequence:
+--         walk path (ground dots, cyan)
+--         jump arc 1 (neon green balls)
+--         landing 1 (yellow sphere)
+--         walk path 2 (ground dots, dimmer cyan)
+--         jump arc 2 (lighter green)
+--         landing 2 (orange sphere)
+--     - Simulates up to 3 future jumps ahead,
+--       each computed from the LANDING position of
+--       the previous one, with time offsets applied
+--       to all laser positions.
+--     - Walk path between landings drawn as flat
+--       ground dots connecting landing to next
+--       safe position.
+--
+--  3. IMPROVED TTI (angular prediction)
+--     - For spinning/rotating lasers, TTI is now:
+--         angle_to_player / angular_speed
+--       instead of distance / linear_speed.
+--     - Falls back to linear TTI for sliding lasers.
+--     - This stops the bot from ignoring fast-spinning
+--       lasers that are geometrically "far" but
+--       rotationally close.
+--
+--  4. All v23 laser hitbox viz and billboard labels
+--     are kept unchanged.
 -- ==========================================
-print("[Movement] v23 loaded")
+print("[Movement] v24 loaded")
 
 local Players    = game:GetService("Players")
 local RunService = game:GetService("RunService")
 
-local player    = Players.LocalPlayer
-local char      = player.Character or player.CharacterAdded:Wait()
-local hum       = char:WaitForChild("Humanoid")
-local root      = char:WaitForChild("HumanoidRootPart")
+local player = Players.LocalPlayer
+local char   = player.Character or player.CharacterAdded:Wait()
+local hum    = char:WaitForChild("Humanoid")
+local root   = char:WaitForChild("HumanoidRootPart")
 
 local lasersFolder = workspace:WaitForChild("Lasers"):WaitForChild("ActiveLasers")
 
 -- ==========================================
 -- ARENA CONSTANTS
 -- ==========================================
-local MAP_X = -178.238647
-local MAP_Y =   40.161911
-local MAP_Z =   12.4262772
-local FLOOR_Y     = MAP_Y + (2.381 / 2)
-local ARENA_R     = 33.0
-local mapCenter   = Vector3.new(MAP_X, FLOOR_Y + 0.5, MAP_Z)
+local MAP_X   = -178.238647
+local MAP_Y   =   40.161911
+local MAP_Z   =   12.4262772
+local FLOOR_Y = MAP_Y + (2.381 / 2)
+local ARENA_R = 33.0
+local mapCenter = Vector3.new(MAP_X, FLOOR_Y + 0.5, MAP_Z)
 
 -- ==========================================
 -- TUNING
 -- ==========================================
-local JUMP_MAX_TTI   = 0.80
-local JUMP_MIN_TTI   = 0.20
-local JUMP_COOLDOWN  = 0.40
-local JUMP_OVERSHOOT = 8.0
-local ANGLE_STEPS    = {0, 15, -15, 30, -30, 45, -45}
-local REPOSITION_TTI   = 3.5
-local SAFE_RADIUS_RING = 16
-local SAFE_SCORE_ANGLES = 48
-local SAFE_UPDATE_HZ    = 0.15
-local REACT_DELAY_MIN = 0.05
-local REACT_DELAY_MAX = 0.12
+local JUMP_MAX_TTI    = 0.65   -- tighter: only plan jump when laser is this close
+local JUMP_MIN_TTI    = 0.18   -- absolute must-jump deadline
+local JUMP_COOLDOWN   = 0.40
+local ANGLE_STEPS     = {0, 12, -12, 25, -25, 40, -40, 55, -55}
+local REPOSITION_TTI  = 4.0
+local SAFE_RING       = 16
+local SAFE_ANGLES     = 48
+local SAFE_HZ         = 0.12
+local REACT_MIN       = 0.05
+local REACT_MAX       = 0.11
 local PAD_X = 0.7
 local PAD_Y = 2.8
 local PAD_Z = 1.0
-local PASS_DIST      = 7.0
-local PASS_VEL_DOT   = -0.25
-local AGGRO_DIST     = 65
-local LASER_MIN_SPD  = 0.3
-local WORLD_RESET    = 130
-local ARC_DOTS     = 24
-local ARC_DOT_SIZE = 0.40
+local PASS_DIST    = 7.0
+local PASS_VEL_DOT = -0.25
+local AGGRO_DIST   = 65
+local MIN_SPD      = 0.3
+local MIN_AV       = 0.04   -- rad/s minimum to use angular TTI
+local WORLD_RESET  = 130
+local MOVE_THRESH  = 0.5
 
--- ==========================================
--- LASER VIZ COLORS
--- ==========================================
-local COL_SAFE    = Color3.fromRGB(0,  255, 80)   -- neon green
-local COL_WARN    = Color3.fromRGB(255, 220, 0)   -- yellow
-local COL_DANGER  = Color3.fromRGB(255,  50, 50)  -- red
-local COL_PASSED  = Color3.fromRGB(80,  80,  80)  -- grey
+-- Path visualizer
+local ARC_DOTS      = 20    -- dots per jump arc
+local WALK_DOTS     = 12    -- dots per walk segment
+local DOT_SZ        = 0.38
+local MAX_PLAN_STEPS = 3    -- how many future jumps to preview
 
+-- Laser viz
+local COL_SAFE   = Color3.fromRGB(0,   255, 80)
+local COL_WARN   = Color3.fromRGB(255, 220, 0)
+local COL_DANGER = Color3.fromRGB(255,  50, 50)
+local COL_PASSED = Color3.fromRGB(80,   80, 80)
 local TTI_WARN   = 1.5
 local TTI_DANGER = 0.5
 
 -- ==========================================
 -- STATE
 -- ==========================================
-local lastCF    = setmetatable({}, {__mode="k"})
-local lastSide  = setmetatable({}, {__mode="k"})
-local passed    = setmetatable({}, {__mode="k"})
+local lastCF   = setmetatable({}, {__mode="k"})
+local lastSide = setmetatable({}, {__mode="k"})
+local passed   = setmetatable({}, {__mode="k"})
 
 local lastJumpTime  = 0
 local jumpCount     = 0
 local runStart      = tick()
 
-local jumpPending       = false
-local jumpPendingTime   = 0
-local jumpPendingDir    = Vector3.new(1,0,0)
-local jumpPendingTarget = Vector3.new(0,0,0)
+local jumpPending     = false
+local jumpPendTime    = 0
+local jumpPendDir     = Vector3.new(1,0,0)
+local jumpPendTarget  = Vector3.new(0,0,0)
 
-local lastSafeTime  = 0
-local cachedSafe    = nil
-local lastMovePos   = nil
-local MOVE_THRESH   = 0.5
-
-local lastRootPos   = nil
-local realMoveDir   = Vector3.zero
+local lastSafeTime = 0
+local cachedSafe   = nil
+local lastMovePos  = nil
+local lastRootPos  = nil
 
 -- ==========================================
--- LASER VISUALIZER CACHE
--- {[laser] = {box=SelectionBox, billboard=BillboardGui, label=TextLabel, adornee=Part}}
+-- LASER HITBOX VIZ CACHE
 -- ==========================================
 local laserVizCache = setmetatable({}, {__mode="k"})
-
-local vizRoot = workspace:FindFirstChild("LaserVizV23")
+local vizRoot = workspace:FindFirstChild("LaserViz24")
 if vizRoot then vizRoot:Destroy() end
 vizRoot = Instance.new("Folder")
-vizRoot.Name = "LaserVizV23"
+vizRoot.Name = "LaserViz24"
 vizRoot.Parent = workspace
 
 local function getOrCreateViz(laser)
     if laserVizCache[laser] then return laserVizCache[laser] end
-
-    -- SelectionBox for neon outline
     local box = Instance.new("SelectionBox")
-    box.Adornee      = laser
-    box.Color3       = COL_SAFE
+    box.Adornee = laser; box.Color3 = COL_SAFE
     box.LineThickness = 0.06
-    box.SurfaceTransparency = 0.85
-    box.SurfaceColor3 = COL_SAFE
-    box.Parent       = vizRoot
+    box.SurfaceTransparency = 0.85; box.SurfaceColor3 = COL_SAFE
+    box.Parent = vizRoot
 
-    -- BillboardGui for TTI label
     local bb = Instance.new("BillboardGui")
-    bb.Adornee        = laser
-    bb.Size           = UDim2.new(0, 120, 0, 54)
-    bb.StudsOffset    = Vector3.new(0, laser.Size.Y/2 + 3.5, 0)
-    bb.AlwaysOnTop    = true
-    bb.MaxDistance    = 120
-    bb.ResetOnSpawn   = false
-    bb.Parent         = vizRoot
+    bb.Adornee = laser
+    bb.Size = UDim2.new(0,120,0,54)
+    bb.StudsOffset = Vector3.new(0, laser.Size.Y/2+3.5, 0)
+    bb.AlwaysOnTop = true; bb.MaxDistance = 120
+    bb.ResetOnSpawn = false; bb.Parent = vizRoot
 
-    local bg = Instance.new("Frame", bb)
+    local bg = Instance.new("Frame",bb)
     bg.Size = UDim2.new(1,0,1,0)
     bg.BackgroundColor3 = Color3.fromRGB(0,0,0)
-    bg.BackgroundTransparency = 0.35
-    bg.BorderSizePixel = 0
-    Instance.new("UICorner", bg).CornerRadius = UDim.new(0,5)
+    bg.BackgroundTransparency = 0.35; bg.BorderSizePixel = 0
+    Instance.new("UICorner",bg).CornerRadius = UDim.new(0,5)
 
-    local nameLbl = Instance.new("TextLabel", bg)
-    nameLbl.Size = UDim2.new(1,-4,0,18)
-    nameLbl.Position = UDim2.new(0,2,0,2)
-    nameLbl.BackgroundTransparency = 1
-    nameLbl.TextColor3 = COL_SAFE
-    nameLbl.Font = Enum.Font.GothamBold
-    nameLbl.TextSize = 11
+    local function mkLbl(y,sz,bold)
+        local l = Instance.new("TextLabel",bg)
+        l.Size = UDim2.new(1,-4,0,sz==11 and 14 or (sz==13 and 16 or 18))
+        l.Position = UDim2.new(0,2,0,y)
+        l.BackgroundTransparency = 1
+        l.TextColor3 = COL_SAFE
+        l.Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham
+        l.TextSize = sz; l.TextXAlignment = Enum.TextXAlignment.Center
+        return l
+    end
+    local nameLbl = mkLbl(2,  11, true)
     nameLbl.Text = laser.Name
-    nameLbl.TextXAlignment = Enum.TextXAlignment.Center
-
-    local ttiLbl = Instance.new("TextLabel", bg)
-    ttiLbl.Size = UDim2.new(1,-4,0,16)
-    ttiLbl.Position = UDim2.new(0,2,0,20)
-    ttiLbl.BackgroundTransparency = 1
-    ttiLbl.TextColor3 = COL_SAFE
-    ttiLbl.Font = Enum.Font.Gotham
-    ttiLbl.TextSize = 13
+    local ttiLbl  = mkLbl(20, 13, false)
     ttiLbl.Text = "TTI: -"
-    ttiLbl.TextXAlignment = Enum.TextXAlignment.Center
-
-    local distLbl = Instance.new("TextLabel", bg)
-    distLbl.Size = UDim2.new(1,-4,0,14)
-    distLbl.Position = UDim2.new(0,2,0,36)
-    distLbl.BackgroundTransparency = 1
-    distLbl.TextColor3 = Color3.fromRGB(180,255,200)
-    distLbl.Font = Enum.Font.Gotham
-    distLbl.TextSize = 11
+    local distLbl = mkLbl(36, 11, false)
     distLbl.Text = "dist: -"
-    distLbl.TextXAlignment = Enum.TextXAlignment.Center
+    distLbl.TextColor3 = Color3.fromRGB(180,255,200)
 
-    local v = {box=box, billboard=bb, nameLbl=nameLbl, ttiLbl=ttiLbl, distLbl=distLbl}
+    local v = {box=box,billboard=bb,nameLbl=nameLbl,ttiLbl=ttiLbl,distLbl=distLbl}
     laserVizCache[laser] = v
     return v
 end
@@ -180,137 +183,175 @@ local function updateLaserViz(laser, tti, dist, isPassed)
     local v = getOrCreateViz(laser)
     local col
     if isPassed then
-        col = COL_PASSED
-        v.ttiLbl.Text = "PASSED"
-        v.distLbl.Text = string.format("dist %.1f", dist)
+        col = COL_PASSED; v.ttiLbl.Text = "PASSED"
+        v.distLbl.Text = string.format("%.1f",dist)
     elseif tti < TTI_DANGER then
-        col = COL_DANGER
-        v.ttiLbl.Text = string.format("TTI %.2fs !", tti)
-        v.distLbl.Text = string.format("dist %.1f", dist)
+        col = COL_DANGER; v.ttiLbl.Text = string.format("TTI %.2fs!",tti)
+        v.distLbl.Text = string.format("%.1f",dist)
     elseif tti < TTI_WARN then
-        col = COL_WARN
-        v.ttiLbl.Text = string.format("TTI %.2fs", tti)
-        v.distLbl.Text = string.format("dist %.1f", dist)
+        col = COL_WARN; v.ttiLbl.Text = string.format("TTI %.2fs",tti)
+        v.distLbl.Text = string.format("%.1f",dist)
     else
-        col = COL_SAFE
-        v.ttiLbl.Text = string.format("TTI %.1fs", tti)
-        v.distLbl.Text = string.format("dist %.1f", dist)
+        col = COL_SAFE; v.ttiLbl.Text = string.format("TTI %.1fs",tti)
+        v.distLbl.Text = string.format("%.1f",dist)
     end
-    v.box.Color3          = col
-    v.box.SurfaceColor3   = col
-    v.nameLbl.TextColor3  = col
-    v.ttiLbl.TextColor3   = col
-
-    -- StudsOffset tracks laser height live
-    v.billboard.StudsOffset = Vector3.new(0, laser.Size.Y/2 + 3.5, 0)
+    v.box.Color3 = col; v.box.SurfaceColor3 = col
+    v.nameLbl.TextColor3 = col; v.ttiLbl.TextColor3 = col
+    v.billboard.StudsOffset = Vector3.new(0, laser.Size.Y/2+3.5, 0)
 end
 
-local function hideAllViz()
+local function purgeDeadViz()
     for laser, v in pairs(laserVizCache) do
         if not laser or not laser.Parent then
             v.box:Destroy(); v.billboard:Destroy()
-            laserVizCache[laser]=nil
+            laserVizCache[laser] = nil
         end
     end
+end
+
+-- ==========================================
+-- PATH VISUALIZER (multi-step)
+-- ==========================================
+local pathRoot = workspace:FindFirstChild("PathViz24")
+if pathRoot then pathRoot:Destroy() end
+pathRoot = Instance.new("Folder")
+pathRoot.Name = "PathViz24"; pathRoot.Parent = workspace
+
+-- Pool: MAX_PLAN_STEPS arcs * ARC_DOTS + walk dots + landing dots
+local ARC_COLORS = {
+    Color3.fromRGB(0,255,80),    -- step 1: bright neon green
+    Color3.fromRGB(0,200,255),   -- step 2: cyan
+    Color3.fromRGB(200,255,0),   -- step 3: lime
+}
+local LAND_COLORS = {
+    Color3.fromRGB(255,220,30),  -- landing 1: yellow
+    Color3.fromRGB(255,140,0),   -- landing 2: orange
+    Color3.fromRGB(200,0,255),   -- landing 3: purple
+}
+local WALK_COLOR = Color3.fromRGB(80,200,255)  -- cyan walk dots
+
+local arcPools   = {}  -- arcPools[step][dot]
+local walkPools  = {}  -- walkPools[step][dot]
+local landDots   = {}
+
+for s = 1, MAX_PLAN_STEPS do
+    arcPools[s] = {}
+    for i = 1, ARC_DOTS do
+        local p = Instance.new("Part")
+        p.Size = Vector3.new(DOT_SZ,DOT_SZ,DOT_SZ)
+        p.Anchored = true; p.CanCollide = false; p.CastShadow = false
+        p.Material = Enum.Material.Neon; p.Shape = Enum.PartType.Ball
+        p.Color = ARC_COLORS[s]; p.Transparency = 1
+        p.Parent = pathRoot
+        arcPools[s][i] = p
+    end
+    walkPools[s] = {}
+    for i = 1, WALK_DOTS do
+        local p = Instance.new("Part")
+        p.Size = Vector3.new(DOT_SZ*0.6, DOT_SZ*0.6, DOT_SZ*0.6)
+        p.Anchored = true; p.CanCollide = false; p.CastShadow = false
+        p.Material = Enum.Material.Neon; p.Shape = Enum.PartType.Ball
+        p.Color = WALK_COLOR; p.Transparency = 1
+        p.Parent = pathRoot
+        walkPools[s][i] = p
+    end
+    local ld = Instance.new("Part")
+    ld.Size = Vector3.new(1.4,1.4,1.4)
+    ld.Anchored = true; ld.CanCollide = false; ld.CastShadow = false
+    ld.Material = Enum.Material.Neon; ld.Shape = Enum.PartType.Ball
+    ld.Color = LAND_COLORS[s]; ld.Transparency = 1
+    ld.Parent = pathRoot
+    landDots[s] = ld
+end
+
+local safeDot = Instance.new("Part")
+safeDot.Size = Vector3.new(1.2,1.2,1.2); safeDot.Anchored = true
+safeDot.CanCollide = false; safeDot.Material = Enum.Material.Neon
+safeDot.Shape = Enum.PartType.Ball; safeDot.Color = COL_SAFE
+safeDot.Transparency = 1; safeDot.Parent = pathRoot
+
+local function hidePath()
+    for s = 1, MAX_PLAN_STEPS do
+        for _, p in ipairs(arcPools[s])  do p.Transparency = 1 end
+        for _, p in ipairs(walkPools[s]) do p.Transparency = 1 end
+        landDots[s].Transparency = 1
+    end
+end
+
+local function drawWalkSeg(step, fromPos, toPos)
+    local pool = walkPools[step]
+    for i = 1, WALK_DOTS do
+        local t = i / WALK_DOTS
+        pool[i].Position = Vector3.new(
+            fromPos.X + (toPos.X-fromPos.X)*t,
+            FLOOR_Y + 0.3,
+            fromPos.Z + (toPos.Z-fromPos.Z)*t
+        )
+        pool[i].Transparency = 0.25 + 0.5*(step-1)/MAX_PLAN_STEPS
+    end
+end
+
+local function drawJumpArc(step, startPos, dir, jp, tAir, g, ws)
+    local pool = arcPools[step]
+    local ts   = tAir / ARC_DOTS
+    local fade = 0.1 + 0.25*(step-1)/MAX_PLAN_STEPS
+    for i = 1, ARC_DOTS do
+        local t = i * ts
+        pool[i].Position = Vector3.new(
+            startPos.X + dir.X*ws*t,
+            startPos.Y + jp*t - 0.5*g*t*t,
+            startPos.Z + dir.Z*ws*t
+        )
+        pool[i].Transparency = fade
+    end
+    local lp = Vector3.new(
+        startPos.X + dir.X*ws*tAir,
+        FLOOR_Y + 0.5,
+        startPos.Z + dir.Z*ws*tAir
+    )
+    landDots[step].Position = lp
+    landDots[step].Transparency = fade
+    return lp  -- return landing pos
 end
 
 -- ==========================================
 -- HUD
 -- ==========================================
 local sg = Instance.new("ScreenGui")
-sg.Name="MovementHUDv23"; sg.ResetOnSpawn=false
-sg.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
-sg.Parent=player.PlayerGui
+sg.Name = "MovHUD24"; sg.ResetOnSpawn = false
+sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+sg.Parent = player.PlayerGui
 
 local frame = Instance.new("Frame")
-frame.Size=UDim2.new(0,230,0,100)
-frame.Position=UDim2.new(1,-242,0,10)
-frame.BackgroundColor3=Color3.fromRGB(8,8,8)
-frame.BackgroundTransparency=0.25
-frame.BorderSizePixel=0
-frame.Parent=sg
-Instance.new("UICorner",frame).CornerRadius=UDim.new(0,8)
+frame.Size = UDim2.new(0,240,0,110)
+frame.Position = UDim2.new(1,-252,0,10)
+frame.BackgroundColor3 = Color3.fromRGB(8,8,8)
+frame.BackgroundTransparency = 0.25
+frame.BorderSizePixel = 0
+frame.Parent = sg
+Instance.new("UICorner",frame).CornerRadius = UDim.new(0,8)
 
 local function lbl(y,col,sz,bold)
-    local l=Instance.new("TextLabel")
-    l.Size=UDim2.new(1,-10,0,20); l.Position=UDim2.new(0,8,0,y)
-    l.BackgroundTransparency=1; l.TextColor3=col
-    l.Font=bold and Enum.Font.GothamBold or Enum.Font.Gotham
-    l.TextSize=sz; l.TextXAlignment=Enum.TextXAlignment.Left
-    l.Parent=frame; return l
+    local l = Instance.new("TextLabel")
+    l.Size = UDim2.new(1,-10,0,20); l.Position = UDim2.new(0,8,0,y)
+    l.BackgroundTransparency = 1; l.TextColor3 = col
+    l.Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham
+    l.TextSize = sz; l.TextXAlignment = Enum.TextXAlignment.Left
+    l.Parent = frame; return l
 end
-local lTimer  = lbl(4,  Color3.fromRGB(80,220,160),17,true)
-local lJumps  = lbl(26, Color3.fromRGB(255,200,60),15,true)
-local lStatus = lbl(50, Color3.fromRGB(200,200,200),13,false)
-local lTTI    = lbl(70, Color3.fromRGB(120,200,255),12,false)
+local lTimer  = lbl(4,  Color3.fromRGB(80,220,160), 17, true)
+local lJumps  = lbl(28, Color3.fromRGB(255,200,60),  15, true)
+local lStatus = lbl(52, Color3.fromRGB(200,200,200), 13, false)
+local lTTI    = lbl(74, Color3.fromRGB(120,200,255), 12, false)
 
-lTimer.Text="[v23] 0.0s"
-lJumps.Text="Jumps: 0"
-lStatus.Text="Waiting..."
-lTTI.Text="TTI: -"
+lTimer.Text  = "[v24] 0.0s"
+lJumps.Text  = "Jumps: 0"
+lStatus.Text = "Waiting..."
+lTTI.Text    = "TTI: -"
 
-local function setStatus(txt,col)
-    lStatus.Text=txt
-    lStatus.TextColor3=col or Color3.fromRGB(200,200,200)
-end
-
--- ==========================================
--- ARC VIZ
--- ==========================================
-local arcVizFolder = workspace:FindFirstChild("ArcVizV23")
-if arcVizFolder then arcVizFolder:Destroy() end
-arcVizFolder = Instance.new("Folder")
-arcVizFolder.Name="ArcVizV23"; arcVizFolder.Parent=workspace
-
-local arcDotPool = {}
-for i=1,ARC_DOTS do
-    local p=Instance.new("Part")
-    p.Size=Vector3.new(ARC_DOT_SIZE,ARC_DOT_SIZE,ARC_DOT_SIZE)
-    p.Anchored=true; p.CanCollide=false; p.CastShadow=false
-    p.Material=Enum.Material.Neon; p.Shape=Enum.PartType.Ball
-    p.Transparency=1; p.Parent=arcVizFolder
-    arcDotPool[i]=p
-end
-
-local safeDot = Instance.new("Part")
-safeDot.Size=Vector3.new(1.2,1.2,1.2); safeDot.Anchored=true
-safeDot.CanCollide=false; safeDot.CastShadow=false
-safeDot.Material=Enum.Material.Neon; safeDot.Shape=Enum.PartType.Ball
-safeDot.Color=Color3.fromRGB(0,255,120); safeDot.Transparency=1
-safeDot.Parent=arcVizFolder
-
-local landDot = Instance.new("Part")
-landDot.Size=Vector3.new(1.4,1.4,1.4); landDot.Anchored=true
-landDot.CanCollide=false; landDot.CastShadow=false
-landDot.Material=Enum.Material.Neon; landDot.Shape=Enum.PartType.Ball
-landDot.Color=Color3.fromRGB(255,220,30); landDot.Transparency=1
-landDot.Parent=arcVizFolder
-
-local function drawArc(startPos, dir, safe)
-    local g  = workspace.Gravity
-    local jp = hum.UseJumpPower and hum.JumpPower or math.sqrt(2*g*hum.JumpHeight)
-    local ws = hum.WalkSpeed
-    local tAir = (2*jp)/g
-    local ts   = tAir/ARC_DOTS
-    local col  = safe and Color3.fromRGB(60,220,100) or Color3.fromRGB(255,60,60)
-    for i=1,ARC_DOTS do
-        local t   = i*ts
-        local pos = Vector3.new(
-            startPos.X + dir.X*ws*t,
-            startPos.Y + jp*t - 0.5*g*t*t,
-            startPos.Z + dir.Z*ws*t
-        )
-        arcDotPool[i].Position=pos; arcDotPool[i].Color=col
-        arcDotPool[i].Transparency=0.15
-    end
-    local lp = Vector3.new(startPos.X+dir.X*ws*tAir, FLOOR_Y+0.5, startPos.Z+dir.Z*ws*tAir)
-    landDot.Position=lp; landDot.Transparency=0.15
-    landDot.Color=safe and Color3.fromRGB(255,220,30) or Color3.fromRGB(255,60,60)
-end
-
-local function hideArc()
-    for _,p in ipairs(arcDotPool) do p.Transparency=1 end
-    landDot.Transparency=1
+local function setStatus(t,c)
+    lStatus.Text = t
+    lStatus.TextColor3 = c or Color3.fromRGB(200,200,200)
 end
 
 -- ==========================================
@@ -323,103 +364,143 @@ local function getJump()
 end
 
 local function clampArena(pos)
-    local dx=pos.X-MAP_X; local dz=pos.Z-MAP_Z
-    local m=math.sqrt(dx*dx+dz*dz)
-    if m>ARENA_R then
-        local s=ARENA_R/m
-        return Vector3.new(MAP_X+dx*s, pos.Y, MAP_Z+dz*s)
+    local dx = pos.X-MAP_X; local dz = pos.Z-MAP_Z
+    local m  = math.sqrt(dx*dx+dz*dz)
+    if m > ARENA_R then
+        return Vector3.new(MAP_X+dx*(ARENA_R/m), pos.Y, MAP_Z+dz*(ARENA_R/m))
     end
     return pos
 end
 
 local function futureCF(laser, vel, av, t)
-    local fp  = laser.Position + vel*t
-    local ba  = math.atan2(laser.CFrame.LookVector.X, laser.CFrame.LookVector.Z)
+    local fp = laser.Position + vel*t
+    local ba = math.atan2(laser.CFrame.LookVector.X, laser.CFrame.LookVector.Z)
     return CFrame.new(fp) * CFrame.Angles(0, ba+av*t, 0)
 end
 
 local function getLaserMotion(laser, oldCF, dt)
-    if not oldCF or dt<0.001 then return Vector3.zero,0 end
-    local tv  = (laser.Position - oldCF.Position)/dt
-    local of  = Vector3.new(oldCF.LookVector.X,0,oldCF.LookVector.Z)
-    local nf  = Vector3.new(laser.CFrame.LookVector.X,0,laser.CFrame.LookVector.Z)
-    local av  = 0
-    if of.Magnitude>0.01 and nf.Magnitude>0.01 then
+    if not oldCF or dt < 0.001 then return Vector3.zero, 0 end
+    local tv = (laser.Position - oldCF.Position) / dt
+    local of = Vector3.new(oldCF.LookVector.X,0,oldCF.LookVector.Z)
+    local nf = Vector3.new(laser.CFrame.LookVector.X,0,laser.CFrame.LookVector.Z)
+    local av = 0
+    if of.Magnitude > 0.01 and nf.Magnitude > 0.01 then
         av = of:Cross(nf).Y / dt
     end
-    local hL  = laser.Size.Z/2
-    local pd  = Vector3.new(nf.Z,0,-nf.X)*math.sign(av+1e-9)
-    return tv + pd*math.abs(av)*hL, av
+    local pd = Vector3.new(nf.Z,0,-nf.X)*math.sign(av+1e-9)
+    return tv + pd*math.abs(av)*(laser.Size.Z/2), av
+end
+
+-- ==========================================
+-- ANGULAR TTI  (improved prediction)
+-- ==========================================
+-- For a rotating laser: TTI = angle_to_sweep / |angular_velocity|
+-- angle_to_sweep = the remaining angle the laser tip must rotate
+-- until the laser plane crosses the player's position.
+local function computeTTI(laser, localZ, vel, av, spd)
+    -- Angular path: laser rotates around its pivot
+    -- Player is at angle theta from laser center in laser's frame
+    -- Remaining angle = localZ * (1/halfLength) in radians (approx)
+    if math.abs(av) > MIN_AV then
+        -- Angular approach: angle remaining = atan(localZ / lateral_offset)
+        -- For a sweep laser the sweep speed at tip = av * halfLength
+        -- localZ is how far the laser plane is from us in the laser's Z axis
+        local halfLen  = laser.Size.Z / 2
+        local angleRem = math.abs(math.atan(localZ / math.max(halfLen*0.1, 1)))
+        local tti_ang  = angleRem / (math.abs(av) + 0.001)
+        -- Blend: if also translating, use minimum of angular and linear TTI
+        local tti_lin  = spd > 0.1 and (localZ/spd) or 999
+        return math.min(tti_ang, tti_lin)
+    end
+    -- Linear only
+    return spd > 0.1 and (localZ/spd) or 999
+end
+
+-- ==========================================
+-- NECESSITY CHECK
+-- ==========================================
+-- Returns true if standing still at `pos` will
+-- result in being hit by `threat` (i.e. jump IS needed).
+-- Simulates the laser position in small steps.
+local function mustJumpToAvoid(threat, pos)
+    local laser = threat.laser
+    local steps = 30
+    local horizon = math.max(threat.tti * 1.8, 1.5)
+    local dt2 = horizon / steps
+    for i = 1, steps do
+        local t   = i * dt2
+        local fcf = futureCF(laser, threat.vel, threat.av, t)
+        local lp  = fcf:PointToObjectSpace(pos)
+        local bX  = laser.Size.X/2 + PAD_X
+        local bY  = laser.Size.Y/2 + PAD_Y
+        local bZ  = laser.Size.Z/2 + PAD_Z
+        if math.abs(lp.X) < bX and math.abs(lp.Y) < bY and math.abs(lp.Z) < bZ then
+            return true
+        end
+    end
+    return false
 end
 
 -- ==========================================
 -- ARC SAFETY CHECK
 -- ==========================================
 local function arcSafe(threats, dir, startPos, timeOffset)
-    if #threats==0 then return true, 999 end
+    if #threats == 0 then return true, 999 end
     local jp, tAir, g, ws = getJump()
     timeOffset = timeOffset or 0
-    local sp  = startPos or root.Position
-    local safe= true
-    local mg  = math.huge
+    local sp   = startPos or root.Position
+    local safe = true; local mg = math.huge
 
     local md = Vector3.new(dir.X,0,dir.Z)
-    if md.Magnitude>0.01 then md=md.Unit else return false,0 end
+    if md.Magnitude > 0.01 then md = md.Unit else return false, 0 end
 
-    local ts = tAir/ARC_DOTS
-    for i=1,ARC_DOTS do
-        local t  = i*ts
+    local ts = tAir / ARC_DOTS
+    for i = 1, ARC_DOTS do
+        local t  = i * ts
         local tp = Vector3.new(
             sp.X + md.X*ws*t,
             sp.Y + jp*t - 0.5*g*t*t,
             sp.Z + md.Z*ws*t
         )
-        for _,th in ipairs(threats) do
+        for _, th in ipairs(threats) do
             local fcf = futureCF(th.laser, th.vel, th.av, t+timeOffset)
             local lp  = fcf:PointToObjectSpace(tp)
             local bX  = th.laser.Size.X/2+PAD_X
             local bY  = th.laser.Size.Y/2+PAD_Y
             local bZ  = th.laser.Size.Z/2+PAD_Z
             if math.abs(lp.X)<bX and math.abs(lp.Y)<bY and math.abs(lp.Z)<bZ then
-                safe=false
+                safe = false
             end
-            local g2 = math.min(
-                bX - math.abs(lp.X),
-                bY - math.abs(lp.Y),
-                bZ - math.abs(lp.Z)
-            )
-            mg = math.min(mg, math.abs(g2))
+            mg = math.min(mg, math.abs(math.min(bX-math.abs(lp.X),bY-math.abs(lp.Y),bZ-math.abs(lp.Z))))
         end
     end
-
+    -- Landing check
     if safe then
         local lp = clampArena(Vector3.new(sp.X+md.X*ws*tAir, FLOOR_Y+0.5, sp.Z+md.Z*ws*tAir))
-        for _,th in ipairs(threats) do
+        for _, th in ipairs(threats) do
             local fcf = futureCF(th.laser, th.vel, th.av, tAir+timeOffset)
             local op  = fcf:PointToObjectSpace(lp)
-            if math.abs(op.X)<th.laser.Size.X/2+PAD_X
-            and math.abs(op.Z)<th.laser.Size.Z/2+PAD_Z then
-                safe=false
+            if math.abs(op.X)<th.laser.Size.X/2+PAD_X and math.abs(op.Z)<th.laser.Size.Z/2+PAD_Z then
+                safe = false
             end
         end
     end
-
     return safe, mg
 end
 
 -- ==========================================
--- COLLECT THREATS  (also drives laser viz)
+-- COLLECT THREATS
 -- ==========================================
 local function collectThreats(dt)
     local out = {}
     local pp  = root.Position
 
-    for _,item in ipairs(lasersFolder:GetChildren()) do
+    for _, item in ipairs(lasersFolder:GetChildren()) do
         if not item:IsA("BasePart") then continue end
-        item.CanCollide=false
+        item.CanCollide = false
 
-        local wd = (item.Position-pp).Magnitude
-        if wd>WORLD_RESET then
+        local wd = (item.Position - pp).Magnitude
+        if wd > WORLD_RESET then
             passed[item]=false; lastSide[item]=nil
             updateLaserViz(item, 999, wd, false)
             continue
@@ -434,103 +515,80 @@ local function collectThreats(dt)
         local vel, av = getLaserMotion(item, oldCF, dt)
         local spd = vel.Magnitude
 
+        -- Passed detection
         if not passed[item] then
-            if spd > LASER_MIN_SPD then
-                local toP = Vector3.new(pp.X-item.Position.X, 0, pp.Z-item.Position.Z)
+            if spd > MIN_SPD then
+                local toP = Vector3.new(pp.X-item.Position.X,0,pp.Z-item.Position.Z)
                 local fv  = Vector3.new(vel.X,0,vel.Z)
-                if toP.Magnitude>0.01 then
-                    local dot = fv:Dot(toP.Unit)
-                    if dot < PASS_VEL_DOT and localZ < PASS_DIST then
-                        passed[item]=true
-                    end
+                if toP.Magnitude>0.01 and fv:Dot(toP.Unit) < PASS_VEL_DOT and localZ < PASS_DIST then
+                    passed[item] = true
                 end
-                local prev=lastSide[item]
-                if prev and prev~=curSide then passed[item]=true end
+                local prev = lastSide[item]
+                if prev and prev ~= curSide then passed[item] = true end
             end
         end
+        lastSide[item] = curSide
 
-        lastSide[item]=curSide
+        if passed[item] then updateLaserViz(item, 999, wd, true); continue end
+        if localZ > AGGRO_DIST then updateLaserViz(item, 999, wd, false); continue end
 
-        if passed[item] then
-            updateLaserViz(item, 999, wd, true)
-            continue
-        end
-        if localZ>AGGRO_DIST then
-            updateLaserViz(item, 999, wd, false)
-            continue
-        end
+        local tti = computeTTI(item, localZ, vel, av, spd)
 
-        local tti = spd>0.1 and (localZ/spd) or 999
-
-        if spd > LASER_MIN_SPD then
+        -- Reject lasers moving away
+        if spd > MIN_SPD then
             local fcf = futureCF(item, vel, av, 0.1)
             local fop = fcf:PointToObjectSpace(pp)
             if math.abs(fop.Z) > localZ + 2.0 then
-                updateLaserViz(item, 999, wd, false)
-                continue
+                updateLaserViz(item, 999, wd, false); continue
             end
         end
 
-        -- Update viz with live TTI
         updateLaserViz(item, tti, wd, false)
-
-        table.insert(out, {
-            laser=item, localZ=localZ, tti=tti,
-            vel=vel, av=av, objPos=objPos,
-            side=curSide, wd=wd, spd=spd
-        })
+        table.insert(out, {laser=item, localZ=localZ, tti=tti, vel=vel, av=av, objPos=objPos, side=curSide, wd=wd, spd=spd})
     end
 
-    -- Clean up viz for lasers no longer in folder
-    hideAllViz()
-
-    table.sort(out, function(a,b) return a.tti<b.tti end)
+    purgeDeadViz()
+    table.sort(out, function(a,b) return a.tti < b.tti end)
     return out
 end
 
 -- ==========================================
 -- PERPENDICULAR JUMP DIRECTION
 -- ==========================================
-local function getBestJumpDir(primary, threats)
+local function getBestJumpDir(primary, threats, fromPos, timeOffset)
+    fromPos    = fromPos or root.Position
+    timeOffset = timeOffset or 0
     local laser = primary.laser
     local fwd   = Vector3.new(laser.CFrame.LookVector.X, 0, laser.CFrame.LookVector.Z)
     if fwd.Magnitude < 0.01 then fwd = Vector3.new(1,0,0) end
     fwd = fwd.Unit
 
-    local perpA = Vector3.new(fwd.Z, 0, -fwd.X)
-    local perpB = Vector3.new(-fwd.Z, 0, fwd.X)
+    local perpA = Vector3.new(fwd.Z,  0, -fwd.X)
+    local perpB = Vector3.new(-fwd.Z, 0,  fwd.X)
 
-    local jp, tAir, _, ws = getJump()
-    local sp = root.Position
+    local _, tAir, _, ws = getJump()
 
     local function landDist(dir)
-        local lp = clampArena(Vector3.new(sp.X+dir.X*ws*tAir, FLOOR_Y+0.5, sp.Z+dir.Z*ws*tAir))
-        local dx=lp.X-MAP_X; local dz=lp.Z-MAP_Z
-        return math.sqrt(dx*dx+dz*dz)
+        local lp = clampArena(Vector3.new(fromPos.X+dir.X*ws*tAir, FLOOR_Y+0.5, fromPos.Z+dir.Z*ws*tAir))
+        return (Vector3.new(lp.X,0,lp.Z) - Vector3.new(MAP_X,0,MAP_Z)).Magnitude
     end
 
     local baseDir = (landDist(perpA) <= landDist(perpB)) and perpA or perpB
 
     for _, deg in ipairs(ANGLE_STEPS) do
         local rad = math.rad(deg)
-        local cos = math.cos(rad); local sin = math.sin(rad)
-        local testDir = Vector3.new(
-            baseDir.X*cos - baseDir.Z*sin, 0,
-            baseDir.X*sin + baseDir.Z*cos
-        )
-        local safe, gap = arcSafe(threats, testDir, nil, 0)
+        local c = math.cos(rad); local s = math.sin(rad)
+        local testDir = Vector3.new(baseDir.X*c - baseDir.Z*s, 0, baseDir.X*s + baseDir.Z*c)
+        local safe, gap = arcSafe(threats, testDir, fromPos, timeOffset)
         if safe then return testDir, true, gap end
     end
 
-    local altBase = (baseDir == perpA) and perpB or perpA
+    local altBase = (baseDir==perpA) and perpB or perpA
     for _, deg in ipairs(ANGLE_STEPS) do
         local rad = math.rad(deg)
-        local cos = math.cos(rad); local sin = math.sin(rad)
-        local testDir = Vector3.new(
-            altBase.X*cos - altBase.Z*sin, 0,
-            altBase.X*sin + altBase.Z*cos
-        )
-        local safe, gap = arcSafe(threats, testDir, nil, 0)
+        local c = math.cos(rad); local s = math.sin(rad)
+        local testDir = Vector3.new(altBase.X*c - altBase.Z*s, 0, altBase.X*s + altBase.Z*c)
+        local safe, gap = arcSafe(threats, testDir, fromPos, timeOffset)
         if safe then return testDir, true, gap end
     end
 
@@ -543,33 +601,91 @@ end
 local function scorePos(pos, threats)
     local score = 0
     for _,th in ipairs(threats) do
-        local op   = th.laser.CFrame:PointToObjectSpace(pos)
-        local lZ   = math.abs(op.Z)
-        local tti  = math.max(th.tti, 0.05)
-        local fop  = futureCF(th.laser, th.vel, th.av, tti*0.5):PointToObjectSpace(pos)
-        local fZ   = math.abs(fop.Z)
-        score = score + (lZ*0.5 + fZ*0.5) / tti
+        local op  = th.laser.CFrame:PointToObjectSpace(pos)
+        local lZ  = math.abs(op.Z)
+        local tti = math.max(th.tti, 0.05)
+        local fop = futureCF(th.laser, th.vel, th.av, tti*0.5):PointToObjectSpace(pos)
+        score = score + (lZ*0.5 + math.abs(fop.Z)*0.5) / tti
     end
     return score
 end
 
 local function getBestSafe(threats, now)
-    if cachedSafe and (now-lastSafeTime)<SAFE_UPDATE_HZ then return cachedSafe end
-    if #threats==0 then cachedSafe=mapCenter; lastSafeTime=now; return mapCenter end
+    if cachedSafe and (now-lastSafeTime) < SAFE_HZ then return cachedSafe end
+    if #threats == 0 then cachedSafe=mapCenter; lastSafeTime=now; return mapCenter end
     local best=-math.huge; local bestPos=mapCenter
     local fy = FLOOR_Y+0.5
-    for i=0,SAFE_SCORE_ANGLES-1 do
-        local a = (i/SAFE_SCORE_ANGLES)*math.pi*2
-        local c = Vector3.new(
-            MAP_X + math.cos(a)*SAFE_RADIUS_RING, fy,
-            MAP_Z + math.sin(a)*SAFE_RADIUS_RING
-        )
+    for i = 0, SAFE_ANGLES-1 do
+        local a = (i/SAFE_ANGLES)*math.pi*2
+        local c = Vector3.new(MAP_X+math.cos(a)*SAFE_RING, fy, MAP_Z+math.sin(a)*SAFE_RING)
         local s = scorePos(c, threats)
-        if s>best then best=s; bestPos=c end
+        if s > best then best=s; bestPos=c end
     end
-    local cs = scorePos(mapCenter, threats)
-    if cs>best then bestPos=mapCenter end
+    if scorePos(mapCenter, threats) > best then bestPos=mapCenter end
     cachedSafe=bestPos; lastSafeTime=now; return bestPos
+end
+
+-- ==========================================
+-- MULTI-STEP PATH PLANNER + VIZ
+-- ==========================================
+-- Simulates up to MAX_PLAN_STEPS jumps ahead.
+-- For each step:
+--   1. Compute safe position from landing spot
+--   2. Draw walk segment from landing to safe
+--   3. Find perpendicular jump dir
+--   4. Draw arc
+-- Returns the list of planned steps for reference.
+local function planAndDrawPath(threats, now)
+    if #threats == 0 then hidePath(); return {} end
+
+    local jp, tAir, g, ws = getJump()
+    local plan = {}
+
+    -- Step 0 start = current position
+    local curPos = root.Position
+    local timeAcc = 0  -- accumulated simulation time
+
+    for step = 1, MAX_PLAN_STEPS do
+        -- Find the closest threat from curPos at timeAcc
+        local bestThreat = nil; local bestTTI = math.huge
+        for _, th in ipairs(threats) do
+            local fcf   = futureCF(th.laser, th.vel, th.av, timeAcc)
+            local objP  = fcf:PointToObjectSpace(curPos)
+            local lZ    = math.abs(objP.Z)
+            local tti   = computeTTI(th.laser, lZ, th.vel, th.av, th.spd)
+            if not passed[th.laser] and tti < bestTTI then
+                bestTTI=tti; bestThreat=th
+            end
+        end
+        if not bestThreat or bestTTI > REPOSITION_TTI then break end
+
+        -- Find safe wait position
+        local safePos = getBestSafe(threats, now)
+        -- Draw walk segment: curPos -> safePos
+        drawWalkSeg(step, curPos, safePos)
+
+        -- Find jump dir from safePos
+        local dir, safe, _ = getBestJumpDir(bestThreat, threats, safePos, timeAcc)
+
+        -- Draw arc from safePos
+        local landPos = drawJumpArc(step, safePos, dir, jp, tAir, g, ws)
+        landPos = clampArena(Vector3.new(landPos.X, FLOOR_Y+0.5, landPos.Z))
+
+        table.insert(plan, {fromPos=safePos, dir=dir, landPos=landPos, safe=safe, tti=bestTTI})
+
+        -- Advance simulation: jump takes tAir seconds
+        timeAcc = timeAcc + tAir + 0.25  -- 0.25s estimated walk time before next jump
+        curPos  = landPos
+    end
+
+    -- Hide unused steps
+    for step = #plan+1, MAX_PLAN_STEPS do
+        for _,p in ipairs(arcPools[step])  do p.Transparency=1 end
+        for _,p in ipairs(walkPools[step]) do p.Transparency=1 end
+        landDots[step].Transparency = 1
+    end
+
+    return plan
 end
 
 -- ==========================================
@@ -582,134 +698,144 @@ local function moveTo(pos)
     end
     lastMovePos=pos; hum:MoveTo(pos)
 end
-
 local function clearMove() lastMovePos=nil end
 
 local function onArena()
-    local p=root.Position
-    local dx=p.X-MAP_X; local dz=p.Z-MAP_Z
-    return math.sqrt(dx*dx+dz*dz)<=(ARENA_R+6)
-        and p.Y>=FLOOR_Y-1 and p.Y<=FLOOR_Y+9
+    local p  = root.Position
+    local dx = p.X-MAP_X; local dz = p.Z-MAP_Z
+    return math.sqrt(dx*dx+dz*dz) <= (ARENA_R+6)
+        and p.Y >= FLOOR_Y-1 and p.Y <= FLOOR_Y+9
 end
 
 -- ==========================================
 -- MAIN LOOP
 -- ==========================================
 RunService.Heartbeat:Connect(function(dt)
-    if not char or hum.Health<=0 then
-        hideArc(); safeDot.Transparency=1
-        setStatus("Dead",Color3.fromRGB(255,80,80))
+    if not char or hum.Health <= 0 then
+        hidePath(); safeDot.Transparency=1
+        setStatus("Dead", Color3.fromRGB(255,80,80))
         clearMove(); return
     end
 
     local now = tick()
-    lTimer.Text = string.format("[v23] %.1fs", now-runStart)
+    lTimer.Text = string.format("[v24] %.1fs", now-runStart)
 
     if not onArena() then
-        hideArc(); safeDot.Transparency=1
-        setStatus("Off arena",Color3.fromRGB(180,180,180))
+        hidePath(); safeDot.Transparency=1
+        setStatus("Off arena", Color3.fromRGB(180,180,180))
         clearMove(); lastRootPos=nil; return
     end
-
-    if lastRootPos then
-        local fl=Vector3.new(root.Position.X-lastRootPos.X,0,root.Position.Z-lastRootPos.Z)
-        if fl.Magnitude>0.005 then realMoveDir=fl.Unit end
-    end
-    lastRootPos=root.Position
 
     local threats = collectThreats(dt)
     local state   = hum:GetState()
     local inAir   = state==Enum.HumanoidStateType.Freefall
                  or state==Enum.HumanoidStateType.Jumping
-    local canJump = (now-lastJumpTime)>=JUMP_COOLDOWN
+    local canJump = (now-lastJumpTime) >= JUMP_COOLDOWN
 
-    if #threats>0 then
+    if #threats > 0 then
         lTTI.Text = string.format("TTI: %.2fs  lZ=%.1f", threats[1].tti, threats[1].localZ)
     else
         lTTI.Text = "TTI: safe"
     end
 
     local bestSafe = getBestSafe(threats, now)
-    safeDot.Position=bestSafe; safeDot.Transparency=0.3
+    safeDot.Position = bestSafe; safeDot.Transparency = 0.3
 
-    if #threats==0 then
-        hideArc(); jumpPending=false
-        setStatus("Safe - holding pos",Color3.fromRGB(80,220,160))
+    -- Draw multi-step path every frame
+    planAndDrawPath(threats, now)
+
+    -- ====== NO THREATS ======
+    if #threats == 0 then
+        jumpPending = false
+        setStatus("Safe - holding", Color3.fromRGB(80,220,160))
         if not inAir then moveTo(bestSafe) end
         return
     end
 
     local primary = threats[1]
 
+    -- ====== IN AIR ======
     if inAir then
-        if jumpPending then moveTo(jumpPendingTarget)
+        if jumpPending then moveTo(jumpPendTarget)
         else moveTo(bestSafe) end
         return
     end
 
-    if jumpPending and now >= jumpPendingTime then
-        local safe, gap = arcSafe(threats, jumpPendingDir, nil, 0)
+    -- ====== FIRE PENDING JUMP ======
+    if jumpPending and now >= jumpPendTime then
+        local safe, _ = arcSafe(threats, jumpPendDir, nil, 0)
         if safe then
             jumpCount=jumpCount+1
-            lJumps.Text=string.format("Jumps: %d",jumpCount)
+            lJumps.Text = string.format("Jumps: %d", jumpCount)
             lastJumpTime=now; jumpPending=false
             clearMove()
-            hum:MoveTo(jumpPendingTarget)
+            hum:MoveTo(jumpPendTarget)
             hum:ChangeState(Enum.HumanoidStateType.Jumping)
-            setStatus("JUMP!",Color3.fromRGB(60,255,100))
-            drawArc(root.Position, jumpPendingDir, true)
+            setStatus("JUMP!", Color3.fromRGB(60,255,100))
             return
         else
             jumpPending=false
-            setStatus("Arc unsafe - replanning",Color3.fromRGB(255,120,40))
+            setStatus("Replanning", Color3.fromRGB(255,120,40))
         end
     end
 
-    local inWindow = primary.tti <= JUMP_MAX_TTI
-    local mustJump = primary.tti <= JUMP_MIN_TTI
-    local needsReposition = primary.tti > REPOSITION_TTI
+    local inWindow     = primary.tti <= JUMP_MAX_TTI
+    local mustJumpNow  = primary.tti <= JUMP_MIN_TTI
+    local needsRepos   = primary.tti > REPOSITION_TTI
 
-    if needsReposition and not jumpPending then
+    -- Reposition when laser is far
+    if needsRepos and not jumpPending then
         moveTo(bestSafe)
-        setStatus("Walking to safe pos",Color3.fromRGB(140,180,255))
-        hideArc(); return
+        setStatus(string.format("Reposition TTI %.1fs", primary.tti), Color3.fromRGB(140,180,255))
+        return
     end
 
+    -- In jump window: check if we actually NEED to jump
     if inWindow and canJump and not jumpPending then
-        local dir, safe, gap = getBestJumpDir(primary, threats)
+
+        -- NECESSITY CHECK: will the laser hit us if we stand still?
+        local needsJump = mustJumpNow or mustJumpToAvoid(primary, root.Position)
+
+        if not needsJump then
+            -- Laser will miss even if we stand still
+            moveTo(bestSafe)
+            setStatus(string.format("No jump needed TTI %.2fs", primary.tti), Color3.fromRGB(0,220,120))
+            return
+        end
+
+        local dir, safe, _ = getBestJumpDir(primary, threats, nil, 0)
         local _, tAir, _, ws = getJump()
         local rawLand = Vector3.new(
-            root.Position.X + dir.X*ws*tAir, FLOOR_Y+0.5,
+            root.Position.X + dir.X*ws*tAir,
+            FLOOR_Y+0.5,
             root.Position.Z + dir.Z*ws*tAir
         )
         local landTarget = clampArena(rawLand)
-        drawArc(root.Position, dir, safe)
 
         if safe then
-            local delay = REACT_DELAY_MIN + math.random()*(REACT_DELAY_MAX-REACT_DELAY_MIN)
-            jumpPending=true; jumpPendingTime=now+delay
-            jumpPendingDir=dir; jumpPendingTarget=landTarget
-            setStatus("Ready to jump...",Color3.fromRGB(255,200,60))
+            local delay = REACT_MIN + math.random()*(REACT_MAX-REACT_MIN)
+            jumpPending=true; jumpPendTime=now+delay
+            jumpPendDir=dir;  jumpPendTarget=landTarget
+            setStatus("Ready...", Color3.fromRGB(255,200,60))
         else
-            if mustJump then
+            if mustJumpNow then
                 jumpCount=jumpCount+1
-                lJumps.Text=string.format("Jumps: %d",jumpCount)
+                lJumps.Text = string.format("Jumps: %d", jumpCount)
                 lastJumpTime=now; clearMove()
                 hum:MoveTo(landTarget)
                 hum:ChangeState(Enum.HumanoidStateType.Jumping)
-                setStatus("FORCED JUMP",Color3.fromRGB(255,80,80))
-                drawArc(root.Position, dir, false)
+                setStatus("FORCED!", Color3.fromRGB(255,80,80))
             else
                 moveTo(bestSafe)
-                setStatus("No safe arc yet",Color3.fromRGB(255,120,40))
+                setStatus("No safe arc", Color3.fromRGB(255,120,40))
             end
         end
         return
     end
 
+    -- Hold position
     if not jumpPending then
         moveTo(bestSafe)
-        setStatus(string.format("Holding - TTI %.2fs",primary.tti),Color3.fromRGB(140,180,255))
-        hideArc()
+        setStatus(string.format("Holding TTI %.2fs", primary.tti), Color3.fromRGB(140,180,255))
     end
 end)
