@@ -1,198 +1,186 @@
--- LaserTracerBot v1.0.0
--- Predictive dodge bot for Laser Game (workspace["Laser Game Map"])
--- Version print: v1.0.0
+-- LaserTracerBot v2.0.0
+-- Full rewrite: teleport-based, predictive laser dodge
+print("[LaserBot] v2.0.0 loaded")
 
-print("[LaserBot] v1.0.0 loaded")
-
-local Players = game:GetService("Players")
+local Players    = game:GetService("Players")
 local RunService = game:GetService("RunService")
 
 local lp = Players.LocalPlayer
-local char = lp.Character or lp.CharacterAdded:Wait()
-local humanoid = char:WaitForChild("Humanoid")
-local hrp = char:WaitForChild("HumanoidRootPart")
 
 -- =====================
 -- ARENA CONSTANTS
 -- =====================
--- Arena center from CFrame: -178.238647, 40.161911, 12.4262772
--- Player max move boundary center: -161, 45, -20
--- We use the CFrame position as the true floor center.
--- Y is set to 45 (player standing Y observed from max move point)
-local ARENA_CENTER = Vector3.new(-178.238647, 45, 12.4262772)
--- Arena cylinder size X = 77.43, so radius = ~38.7
--- We keep bot safely inside at 70% of radius = ~27 studs
-local SAFE_RADIUS = 27
--- Laser half-width (size Z / 2 = 1.6206 / 2 ~= 0.81) plus safety buffer
-local LASER_DANGER_WIDTH = 3.5
--- How many seconds ahead to predict laser positions
-local LOOKAHEAD = 1.0
--- Angular resolution when scanning safe zones (degrees)
-local ANGLE_STEP = 8
--- Movement jitter range in studs (makes bot look more human)
-local JITTER = 1.2
+local ARENA_CENTER   = Vector3.new(-178.238647, 45, 12.4262772)
+local SAFE_RADIUS    = 25     -- studs from center the bot orbits
+local LASER_HALF_W   = 4     -- danger half-width (laser Z=1.62 + buffer)
+local LOOKAHEAD      = 0.8   -- seconds ahead to predict
+local ANGLE_STEP     = 6     -- degrees between candidate slots
+local MOVE_COOLDOWN  = 0.2   -- min seconds between teleports
+local PROXIMITY      = 18    -- studs: proactive flee threshold
 
 -- =====================
--- LASER HELPERS
+-- LASER FETCH
 -- =====================
-local function getActiveLasers()
-    local lasers = {}
-    local folder = workspace:FindFirstChild("Lasers")
-    if not folder then return lasers end
-    local active = folder:FindFirstChild("ActiveLasers")
-    if not active then return lasers end
-    for _, obj in ipairs(active:GetChildren()) do
-        if obj:IsA("BasePart") then
-            table.insert(lasers, obj)
+local function getLasers()
+    local result = {}
+    local root = workspace:FindFirstChild("Lasers")
+    if not root then return result end
+    local active = root:FindFirstChild("ActiveLasers")
+    if not active then return result end
+    for _, p in ipairs(active:GetChildren()) do
+        if p:IsA("BasePart") then
+            table.insert(result, p)
         end
     end
-    return lasers
+    return result
 end
 
--- Returns the 2D (X, Z) direction the laser is facing on the floor plane
-local function getLaserDirection(laser)
-    return Vector3.new(
-        laser.CFrame.LookVector.X,
-        0,
-        laser.CFrame.LookVector.Z
-    ).Unit
-end
+-- =====================
+-- ANGULAR VELOCITY CACHE
+-- =====================
+local prevAngles = {}
 
--- Estimate angular velocity of a laser by sampling two frames
-local laserPrevAngles = {}
-local function getLaserAngularVelocity(laser)
-    local id = laser:GetDebugId()
-    local dir = getLaserDirection(laser)
-    local currentAngle = math.atan2(dir.Z, dir.X)
-    if laserPrevAngles[id] then
-        local delta = currentAngle - laserPrevAngles[id]
-        -- Wrap delta to [-pi, pi]
-        if delta > math.pi then delta = delta - 2 * math.pi end
-        if delta < -math.pi then delta = delta + 2 * math.pi end
-        laserPrevAngles[id] = currentAngle
-        return delta -- radians per frame (Heartbeat)
-    else
-        laserPrevAngles[id] = currentAngle
-        return 0
+local function getAngVel(laser)
+    local id  = laser:GetDebugId()
+    local lv  = laser.CFrame.LookVector
+    local ang = math.atan2(lv.Z, lv.X)
+    if prevAngles[id] then
+        local d = ang - prevAngles[id]
+        if d >  math.pi then d = d - 2*math.pi end
+        if d < -math.pi then d = d + 2*math.pi end
+        prevAngles[id] = ang
+        return d
     end
-end
-
--- Predict where the laser direction will be LOOKAHEAD seconds from now
--- angularVelocity is radians/frame; assume 60fps -> radians/sec = vel * 60
-local function predictLaserAngle(laser, angVel)
-    local dir = getLaserDirection(laser)
-    local currentAngle = math.atan2(dir.Z, dir.X)
-    local predictedAngle = currentAngle + (angVel * 60 * LOOKAHEAD)
-    return predictedAngle -- radians
+    prevAngles[id] = ang
+    return 0
 end
 
 -- =====================
--- SAFE ZONE SCORER
+-- DANGER CHECK
 -- =====================
--- Score a candidate position: higher = safer
--- Penalizes positions that are in the sweep path of any laser
-local function scorePosition(candidate, lasers, angVels)
-    local score = 0
-    local cx, cz = candidate.X, candidate.Z
+local function isDangerous(px, pz, laser, ahead, angVel)
+    local lv  = laser.CFrame.LookVector
+    local cur = math.atan2(lv.Z, lv.X)
+    local predicted = cur + angVel * 60 * ahead
 
-    for i, laser in ipairs(lasers) do
-        local lpos = laser.Position
-        local predictedAngle = predictLaserAngle(laser, angVels[i])
+    local dx   = px - laser.Position.X
+    local dz   = pz - laser.Position.Z
+    local dist = math.sqrt(dx*dx + dz*dz)
+    if dist < 0.1 then return true end
 
-        -- Vector from laser origin to candidate
-        local dx = cx - lpos.X
-        local dz = cz - lpos.Z
-        local dist = math.sqrt(dx * dx + dz * dz)
-        if dist < 0.001 then dist = 0.001 end
+    local pointAngle = math.atan2(dz, dx)
+    local diff = pointAngle - predicted
+    if diff >  math.pi then diff = diff - 2*math.pi end
+    if diff < -math.pi then diff = diff + 2*math.pi end
 
-        -- Angle from laser origin to candidate
-        local candAngle = math.atan2(dz, dx)
-
-        -- Angular difference between predicted laser direction and candidate
-        local angleDiff = candAngle - predictedAngle
-        if angleDiff > math.pi then angleDiff = angleDiff - 2 * math.pi end
-        if angleDiff < -math.pi then angleDiff = angleDiff + 2 * math.pi end
-
-        -- Angular half-width of danger zone at this distance
-        local dangerHalfAngle = math.atan2(LASER_DANGER_WIDTH, dist)
-
-        local danger = math.max(0, dangerHalfAngle - math.abs(angleDiff))
-        score = score - (danger * 100) -- heavy penalty for being in laser path
-    end
-
-    -- Slight bonus for staying near center (more escape routes)
-    local dx = cx - ARENA_CENTER.X
-    local dz = cz - ARENA_CENTER.Z
-    local distFromCenter = math.sqrt(dx * dx + dz * dz)
-    score = score - (distFromCenter * 0.5)
-
-    return score
+    local perp = math.abs(math.sin(diff)) * dist
+    return perp < LASER_HALF_W
 end
 
 -- =====================
--- BEST POSITION FINDER
+-- SAFE SLOT FINDER
 -- =====================
-local function getBestPosition(lasers, angVels)
+local function findSafe(lasers, angVels)
     local bestScore = -math.huge
-    local bestPos = hrp.Position
+    local bestPos   = nil
 
-    for angleDeg = 0, 359, ANGLE_STEP do
-        local rad = math.rad(angleDeg)
-        local candidate = Vector3.new(
-            ARENA_CENTER.X + math.cos(rad) * SAFE_RADIUS,
-            ARENA_CENTER.Y,
-            ARENA_CENTER.Z + math.sin(rad) * SAFE_RADIUS
-        )
-        local s = scorePosition(candidate, lasers, angVels)
-        if s > bestScore then
-            bestScore = s
-            bestPos = candidate
+    for deg = 0, 359, ANGLE_STEP do
+        local rad = math.rad(deg)
+        local cx  = ARENA_CENTER.X + math.cos(rad) * SAFE_RADIUS
+        local cz  = ARENA_CENTER.Z + math.sin(rad) * SAFE_RADIUS
+
+        local safe  = true
+        local score = 0
+
+        for i, laser in ipairs(lasers) do
+            local av = angVels[i]
+            if isDangerous(cx, cz, laser, 0, av) then
+                safe = false; break
+            end
+            if isDangerous(cx, cz, laser, LOOKAHEAD, av) then
+                score = score - 300
+            end
+            local dx = cx - laser.Position.X
+            local dz = cz - laser.Position.Z
+            score = score + math.sqrt(dx*dx + dz*dz) * 0.4
+        end
+
+        if safe then
+            local dx = cx - ARENA_CENTER.X
+            local dz = cz - ARENA_CENTER.Z
+            score = score - math.sqrt(dx*dx + dz*dz) * 0.15
+
+            if score > bestScore then
+                bestScore = score
+                bestPos   = Vector3.new(cx, ARENA_CENTER.Y, cz)
+            end
         end
     end
-
-    -- Also score current position so we don't move unnecessarily
-    local currentScore = scorePosition(
-        Vector3.new(hrp.Position.X, ARENA_CENTER.Y, hrp.Position.Z),
-        lasers, angVels
-    )
-    if currentScore >= bestScore - 5 then
-        bestPos = hrp.Position -- stay put if current spot is nearly as good
-    end
-
-    -- Add jitter
-    bestPos = Vector3.new(
-        bestPos.X + (math.random() - 0.5) * JITTER * 2,
-        ARENA_CENTER.Y,
-        bestPos.Z + (math.random() - 0.5) * JITTER * 2
-    )
 
     return bestPos
 end
 
 -- =====================
+-- TELEPORT
+-- =====================
+local function tp(pos)
+    local c = lp.Character
+    if not c then return end
+    local hrp = c:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        hrp.CFrame = CFrame.new(pos)
+    end
+end
+
+-- =====================
 -- MAIN LOOP
 -- =====================
-local angVelCache = {}
+local lastMove = 0
 
 RunService.Heartbeat:Connect(function()
-    char = lp.Character
-    if not char then return end
-    humanoid = char:FindFirstChildOfClass("Humanoid")
-    hrp = char:FindFirstChild("HumanoidRootPart")
-    if not humanoid or not hrp then return end
-    if humanoid.Health <= 0 then return end
+    local c = lp.Character
+    if not c then return end
+    local hrp = c:FindFirstChild("HumanoidRootPart")
+    local hum = c:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum or hum.Health <= 0 then return end
 
-    local lasers = getActiveLasers()
+    local lasers = getLasers()
     if #lasers == 0 then return end
 
-    -- Sample angular velocities this frame
     local angVels = {}
     for i, laser in ipairs(lasers) do
-        angVels[i] = getLaserAngularVelocity(laser)
+        angVels[i] = getAngVel(laser)
     end
 
-    local target = getBestPosition(lasers, angVels)
-    humanoid:MoveTo(target)
+    local px  = hrp.Position.X
+    local pz  = hrp.Position.Z
+    local now = tick()
+
+    local danger = false
+    for i, laser in ipairs(lasers) do
+        if isDangerous(px, pz, laser, 0, angVels[i]) then
+            danger = true; break
+        end
+        if isDangerous(px, pz, laser, LOOKAHEAD, angVels[i]) then
+            danger = true; break
+        end
+        local lv = laser.CFrame.LookVector
+        local tipX = laser.Position.X + lv.X * PROXIMITY
+        local tipZ = laser.Position.Z + lv.Z * PROXIMITY
+        local dx = px - tipX
+        local dz = pz - tipZ
+        if math.sqrt(dx*dx + dz*dz) < PROXIMITY * 0.5 then
+            danger = true; break
+        end
+    end
+
+    if danger or (now - lastMove) > MOVE_COOLDOWN then
+        local safe = findSafe(lasers, angVels)
+        if safe then
+            tp(safe)
+            lastMove = now
+        end
+    end
 end)
 
-print("[LaserBot] v1.0.0 running - good luck surviving")
+print("[LaserBot] v2.0.0 running")
